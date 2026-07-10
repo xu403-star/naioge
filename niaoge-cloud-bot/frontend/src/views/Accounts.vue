@@ -1040,21 +1040,52 @@ async function runDaily(acc) {
 async function waitDailyCompleteAndRefresh(id) {
   // 任务执行期间只检查日志是否完成，不调用 queryAccountStatus 刷新进度，
   // 避免任务完成后又因查询而重新建立连接占槽位。
-  for (let i = 0; i < 20; i++) {
+  for (let i = 0; i < 60; i++) {
     await new Promise(r => setTimeout(r, 3000))
     try {
       const acc = accounts.value.find(a => a.id === id)
       const name = acc?.name || id
 
       // 从日志中检测该账号的每日任务是否已完成
-      const serverLogs = await api.get('/api/control/logs?limit=100')
+      const serverLogs = await api.get('/api/control/logs?limit=200')
       const completed = serverLogs.some(l =>
-        l.message && l.message.includes(`[${name}]`) && /手动每日任务完成|所有任务执行完成/.test(l.message)
+        l.message && l.message.includes(`[${name}]`) && /手动每日任务完成|所有任务执行完成|每日任务完成/.test(l.message)
       )
       if (completed) {
+        // 优先从最终活跃度日志解析实时分数，避免快照读不到最新值
+        const finalLog = serverLogs.find(l =>
+          l.message && l.message.includes(`[${name}]`) && /最终活跃度:\s*\d+\/\d+/.test(l.message)
+        )
+        let parsedPoint = null
+        let parsedMax = null
+        if (finalLog) {
+          const match = finalLog.message.match(/最终活跃度:\s*(\d+)\/(\d+)/)
+          if (match) {
+            parsedPoint = parseInt(match[1], 10)
+            parsedMax = parseInt(match[2], 10)
+          }
+        }
+        if (parsedPoint !== null) {
+          const current = accountStatusMap[id] || {}
+          accountStatusMap[id] = {
+            ...current,
+            dailyPoint: parsedPoint,
+            dailyPointMax: parsedMax,
+            snapshot: true
+          }
+        }
         // 任务完成：只读快照，不再触发连接，并把前端状态改为离线
         await loadAccountDailySnapshot(id)
         await loadAccountCarSnapshot(id)
+        // 如果快照返回过期/0分但日志已解析出有效值，恢复解析值
+        if (parsedPoint !== null && accountStatusMap[id]?.dailyPoint === 0) {
+          accountStatusMap[id] = {
+            ...(accountStatusMap[id] || {}),
+            dailyPoint: parsedPoint,
+            dailyPointMax: parsedMax,
+            snapshot: true
+          }
+        }
         if (acc) {
           acc.status = 'disconnected'
           const s = accountStatusMap[id]
@@ -1062,7 +1093,9 @@ async function waitDailyCompleteAndRefresh(id) {
         }
         return
       }
-    } catch {}
+    } catch (e) {
+      console.error('waitDailyCompleteAndRefresh error', e)
+    }
   }
 }
 

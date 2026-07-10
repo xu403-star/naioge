@@ -5,6 +5,7 @@
 import * as db from "./db.js";
 import { CarTasks } from "./batch/tasksCar.js";
 import { isExecutedToday, markExecutedToday } from "./batch/dailyExecutedUtils.js";
+import { getSnapshotDay as getDailySnapshotDay, saveDailySnapshot } from "./game/gameStatus.js";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -1034,7 +1035,9 @@ export class TaskRunner {
       const finalResp = await this.pool.sendMessage(accountId, "role_getroleinfo", {}, 5000);
       const finalDailyTask = finalResp?.role?.dailyTask ?? {};
       const { point: finalPoint, max: finalMax } = getDailyPointInfo(finalDailyTask);
-      this.log(`最终活跃度: ${finalPoint}/${finalMax}`, "success");
+      this.log(`[${accountName}] 最终活跃度: ${finalPoint}/${finalMax}`, "success");
+      // 把最终活跃度写入账号 settings，刷新页面也不会丢失
+      saveDailySnapshot(accountId, finalPoint, finalMax);
     } catch (e) { /* ignore */ }
 
     if (this.callbacks.onProgress) this.callbacks.onProgress(100);

@@ -5,7 +5,7 @@
 import * as db from "../db.js";
 
 /** 获取当前日期字符串（按每天 1:00 作为跨天边界） */
-function getSnapshotDay() {
+export function getSnapshotDay() {
   const now = new Date();
   // 如果早于 1:00，则视为前一天
   if (now.getHours() < 1) {
@@ -15,7 +15,7 @@ function getSnapshotDay() {
 }
 
 /** 持久化活跃度快照 */
-function saveDailySnapshot(accountId, point, max) {
+export function saveDailySnapshot(accountId, point, max) {
   try {
     db.saveAccountSettings(accountId, {
       lastDailyPoint: point,

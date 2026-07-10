@@ -1,6 +1,13 @@
-$null
-nul
 .codebuddy/
 niaoge-cloud-bot.zip
 node_modules/
 .env
+
+# Runtime data
+niaoge-cloud-bot/data/cloud-bot.db
+
+# Frontend build output
+niaoge-cloud-bot/dist-vue/
+
+# Temporary backups
+niaoge-cloud-bot/rollback-backup/

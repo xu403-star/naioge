@@ -105,7 +105,7 @@ function addLog(entry) {
   }
   const normalized = {
     time,
-    level: entry.level || "info",
+    level: entry.level || entry.type || "info",
     message: entry.message,
     accountId: entry.accountId || null,
   };
@@ -994,32 +994,6 @@ app.get("/api/game/result/:id/:feature", (req, res) => {
 app.delete("/api/game/result/:id/:feature", (req, res) => {
   queryResults.delete(`${req.params.id}:${req.params.feature}`);
   res.json({ success: true });
-});
-
-// ======== 日常状态 ========
-
-/** 获取最近一次活跃度快照（离线也可读，不触发连接） */
-app.get("/api/game/last-daily-status/:id", (req, res) => {
-  const id = req.params.id;
-  const account = db.getAccount(id, req.userKey);
-  if (!account) return res.status(404).json({ error: "账号不存在" });
-  const settings = (() => {
-    try { return JSON.parse(account.settings || '{}'); } catch { return {}; }
-  })();
-
-  const today = new Date();
-  if (today.getHours() < 1) today.setDate(today.getDate() - 1);
-  const todayDay = today.toISOString().slice(0, 10);
-  const snapshotDay = settings.lastDailyDay || null;
-
-  // 快照跨天（过了 1:00）则视为过期，返回 0
-  const expired = !snapshotDay || snapshotDay !== todayDay;
-  res.json({
-    dailyPoint: expired ? 0 : (settings.lastDailyPoint ?? 0),
-    dailyPointMax: expired ? 100 : (settings.lastDailyPointMax ?? 100),
-    snapshotDay,
-    expired
-  });
 });
 
 /** 获取角色完整状态 */
