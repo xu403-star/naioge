@@ -1,0 +1,548 @@
+<template>
+  <div class="dashboard-page">
+    <div class="dashboard-layout">
+      <!-- 左侧：账号列表 -->
+      <div class="dashboard-left">
+        <div class="panel account-panel">
+          <div class="panel-header">
+            <h2>账号列表</h2>
+            <div class="panel-actions">
+              <button class="btn btn-outline btn-sm" @click="refreshAll">刷新</button>
+              <button class="btn btn-primary btn-sm" @click="$router.push('/bind')">添加</button>
+            </div>
+          </div>
+
+          <div class="account-toolbar">
+            <label class="check-all">
+              <input type="checkbox" :checked="allSelected" :indeterminate="isIndeterminate" @change="toggleSelectAll" />
+              <span>全选</span>
+            </label>
+            <button class="btn btn-xs btn-outline" @click="selectConnected">在线</button>
+            <span class="selected-count">已选 {{ selectedCount }} / {{ accounts.length }}</span>
+          </div>
+
+          <div v-if="loading" class="flex-center" style="padding:48px"><div class="spinner"></div></div>
+
+          <div v-else-if="accounts.length === 0" class="empty-state">
+            <p>还没有添加任何账号</p>
+            <button class="btn btn-primary" @click="$router.push('/bind')" style="width:auto">绑定账号</button>
+          </div>
+
+          <div v-else class="account-list">
+            <div v-for="acc in accounts" :key="acc.id"
+              class="account-row" :class="{ selected: selectedIds.has(acc.id), connected: acc.status === 'connected' }"
+              @click="toggleSelect(acc.id)"
+            >
+              <input type="checkbox" :checked="selectedIds.has(acc.id)" @click.stop tabindex="-1" />
+              <div class="account-avatar-sm" :style="{ background: avatarColor(acc.id) }">
+                {{ (acc.name || acc.id)[0]?.toUpperCase() }}
+              </div>
+              <div class="account-main">
+                <div class="account-name-line">
+                  <span class="account-name">{{ acc.name || acc.id }}</span>
+                  <span class="status-tag" :class="acc.status === 'connected' ? 'status-online' : 'status-offline'">
+                    {{ acc.status === 'connected' ? '在线' : '离线' }}
+                  </span>
+                </div>
+                <div class="account-meta-sm">
+                  <span>{{ acc.server || '未知区服' }}</span>
+                  <span v-if="acc.level">· Lv.{{ acc.level }}</span>
+                  <span v-if="acc.last_login">· {{ formatTime(acc.last_login) }}</span>
+                </div>
+              </div>
+              <div class="account-row-actions" @click.stop>
+                <button v-if="acc.status === 'connected'" class="btn btn-xs btn-outline" style="color:var(--danger)" @click="toggleConnect(acc)">断开</button>
+                <button v-else class="btn btn-xs btn-primary" @click="toggleConnect(acc)">连接</button>
+                <button class="btn btn-xs btn-outline" @click="runDaily(acc)">每日</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 右侧：批量操作 + 日志 -->
+      <div class="dashboard-right">
+        <div class="panel batch-panel">
+          <div class="panel-header">
+            <h2>批量操作</h2>
+            <div class="panel-actions" v-if="hasSelection">
+              <button class="btn btn-outline btn-sm" @click="batchConnect">连接</button>
+              <button class="btn btn-outline btn-sm" @click="batchDisconnect">断开</button>
+              <button class="btn btn-primary btn-sm" @click="batchDaily">每日</button>
+              <button v-if="running" class="btn btn-danger btn-sm" @click="abortBatch">停止</button>
+            </div>
+          </div>
+
+          <div v-if="runStatus" class="run-status" style="padding: 10px 16px; font-size: 13px; color: var(--text-muted); border-bottom: 1px solid var(--border);">
+            状态:
+            <span style="color: var(--success)">{{ runStatus.summary?.completed || 0 }} 完成</span> /
+            <span style="color: var(--danger)">{{ runStatus.summary?.failed || 0 }} 失败</span> /
+            <span>{{ runStatus.summary?.running || 0 }} 执行中</span>
+          </div>
+
+          <div class="tab-bar">
+            <button v-for="cat in categories" :key="cat.key"
+              class="tab-btn" :class="{ active: activeTab === cat.key }"
+              @click="activeTab = cat.key">{{ cat.label }}</button>
+          </div>
+
+          <div class="op-grid">
+            <button v-for="op in currentOps" :key="op.key"
+              class="op-btn" :class="{ danger: op.danger }"
+              @click="runBatch(op.key, op.label)"
+              :disabled="!hasSelection || running">
+              {{ op.label }}
+            </button>
+          </div>
+        </div>
+
+        <div v-if="logs.length > 0" class="panel log-panel">
+          <div class="panel-header">
+            <h2>执行日志</h2>
+            <button class="btn btn-xs btn-outline" @click="logs = []">清空</button>
+          </div>
+          <div class="log-list" ref="logListRef">
+            <div v-for="(log, i) in logs" :key="i" class="log-line" :class="log.type">
+              <span class="log-time">{{ log.time }}</span>
+              <span class="log-message">{{ log.message }}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</template>
+
+<script setup>
+import { ref, computed, onMounted, nextTick, watch } from 'vue'
+import { api } from '../api'
+import { useToastStore } from '../stores/toast'
+
+const toast = useToastStore()
+const accounts = ref([])
+const loading = ref(true)
+const selectedIds = ref(new Set())
+const activeTab = ref('daily')
+const running = ref(false)
+const logs = ref([])
+const logListRef = ref(null)
+
+const allSelected = computed(() => accounts.value.length > 0 && accounts.value.every(a => selectedIds.value.has(a.id)))
+const isIndeterminate = computed(() => selectedIds.value.size > 0 && selectedIds.value.size < accounts.value.length)
+const selectedCount = computed(() => selectedIds.value.size)
+const hasSelection = computed(() => selectedCount.value > 0)
+
+const categories = [
+  { key: 'daily', label: '日常' },
+  { key: 'dungeon', label: '副本' },
+  { key: 'baoku', label: '宝库' },
+  { key: 'weirdTower', label: '怪异塔' },
+  { key: 'resource', label: '资源' },
+  { key: 'legacy', label: '功法' },
+  { key: 'monthly', label: '月度' },
+]
+
+const allOps = {
+  daily: [
+    { key: 'claimHangUp', label: '领取挂机' },
+    { key: 'addHangUpTime', label: '一键加钟' },
+    { key: 'resetBottles', label: '重置罐子' },
+    { key: 'claimBottles', label: '一键领罐子' },
+    { key: 'clubSign', label: '俱乐部签到' },
+    { key: 'study', label: '一键答题' },
+    { key: 'arena', label: '竞技场3次' },
+    { key: 'smartSendCar', label: '智能发车' },
+    { key: 'claimCars', label: '一键收车' },
+    { key: 'blackMarket', label: '黑市采购' },
+    { key: 'treasurePavilion', label: '珍宝阁' },
+    { key: 'genieSweep', label: '灯神扫荡' },
+    { key: 'freeGacha', label: '免费扭蛋' },
+  ],
+  dungeon: [
+    { key: 'tower', label: '一键爬塔' },
+    { key: 'dream', label: '一键梦境' },
+    { key: 'skinChallenge', label: '换皮闯关' },
+    { key: 'peachTasks', label: '蟠桃园任务' },
+    { key: 'dreamShop', label: '梦境商品' },
+  ],
+  baoku: [
+    { key: 'baoku13', label: '宝库前3层' },
+    { key: 'baoku45', label: '宝库4-5层' },
+  ],
+  weirdTower: [
+    { key: 'weirdTower', label: '爬怪异塔' },
+    { key: 'weirdTowerUseItems', label: '使用道具' },
+    { key: 'weirdTowerMerge', label: '怪异塔合成' },
+    { key: 'weirdTowerFreeEnergy', label: '免费道具' },
+  ],
+  resource: [
+    { key: 'chest', label: '批量开箱' },
+    { key: 'chestPoints', label: '宝箱积分' },
+    { key: 'fish', label: '批量钓鱼' },
+    { key: 'recruit', label: '批量招募' },
+    { key: 'heroUpgrade', label: '英雄升星' },
+    { key: 'bookUpgrade', label: '图鉴升星' },
+    { key: 'fourSaints', label: '四圣碎片' },
+    { key: 'skinCoins', label: '5皮肤币' },
+  ],
+  legacy: [
+    { key: 'legacyClaim', label: '功法领取' },
+    { key: 'legacyGift', label: '功法赠送' },
+  ],
+  monthly: [
+    { key: 'topUpFish', label: '钓鱼补齐' },
+    { key: 'topUpArena', label: '竞技场补齐' },
+  ],
+}
+
+const currentOps = computed(() => allOps[activeTab.value] || [])
+
+const avatarColors = ['#6366f1','#8b5cf6','#3b82f6','#06b6d4','#10b981','#f59e0b','#ef4444','#ec4899']
+function avatarColor(id) {
+  let hash = 0
+  for (let i = 0; i < (id || '').length; i++) hash = ((hash << 5) - hash) + id.charCodeAt(i)
+  return avatarColors[Math.abs(hash) % avatarColors.length]
+}
+
+function formatTime(t) {
+  if (!t) return ''
+  const d = new Date(t)
+  const now = new Date()
+  const diff = now - d
+  if (diff < 60000) return '刚刚'
+  if (diff < 3600000) return Math.floor(diff / 60000) + '分钟前'
+  if (diff < 86400000) return Math.floor(diff / 3600000) + '小时前'
+  return d.toLocaleDateString()
+}
+
+async function loadAccounts() {
+  try {
+    accounts.value = await api.get('/api/accounts') || []
+  } catch { }
+}
+
+onMounted(async () => {
+  await loadAccounts()
+  loading.value = false
+})
+
+function toggleSelectAll() {
+  if (allSelected.value) {
+    selectedIds.value = new Set()
+  } else {
+    selectedIds.value = new Set(accounts.value.map(a => a.id))
+  }
+}
+
+function toggleSelect(id) {
+  const next = new Set(selectedIds.value)
+  if (next.has(id)) next.delete(id)
+  else next.add(id)
+  selectedIds.value = next
+}
+
+function selectConnected() {
+  selectedIds.value = new Set(accounts.value.filter(a => a.status === 'connected').map(a => a.id))
+}
+
+async function refreshAll() {
+  loading.value = true
+  await loadAccounts()
+  loading.value = false
+  toast.show('已刷新')
+}
+
+async function toggleConnect(acc) {
+  try {
+    if (acc.status === 'connected') {
+      await api.post(`/api/control/disconnect/${acc.id}`)
+    } else {
+      await api.post(`/api/control/connect/${acc.id}`)
+    }
+    toast.show(acc.status === 'connected' ? '已断开' : '连接中...')
+    await loadAccounts()
+  } catch (e) {
+    toast.show('操作失败: ' + e.message)
+  }
+}
+
+async function runDaily(acc) {
+  try {
+    const settings = await api.get(`/api/accounts/${acc.id}/settings`).catch(() => ({}))
+    await api.post(`/api/control/run-daily/${acc.id}`, { settings })
+    toast.show(`已触发: ${acc.name || acc.id}`)
+  } catch (e) {
+    toast.show('执行失败: ' + e.message)
+  }
+}
+
+async function batchConnect() {
+  const ids = [...selectedIds.value]
+  addLog(`批量连接 ${ids.length} 个账号`)
+  for (const id of ids) {
+    const acc = accounts.value.find(a => a.id === id)
+    try {
+      await api.post(`/api/control/connect/${id}`)
+      addLog(`[${acc?.name || id}] 连接已触发`, 'success')
+    } catch (e) {
+      addLog(`[${acc?.name || id}] 连接失败: ${e.message}`, 'error')
+    }
+    await new Promise(r => setTimeout(r, 1500))
+  }
+  await loadAccounts()
+}
+
+async function batchDisconnect() {
+  const ids = [...selectedIds.value]
+  addLog(`批量断开 ${ids.length} 个账号`)
+  for (const id of ids) {
+    const acc = accounts.value.find(a => a.id === id)
+    try {
+      await api.post(`/api/control/disconnect/${id}`)
+      addLog(`[${acc?.name || id}] 已断开`, 'success')
+    } catch (e) {
+      addLog(`[${acc?.name || id}] 断开失败: ${e.message}`, 'error')
+    }
+  }
+  await loadAccounts()
+}
+
+async function batchDaily() {
+  const ids = [...selectedIds.value]
+  addLog(`批量执行每日任务 ${ids.length} 个账号`)
+  for (const id of ids) {
+    const acc = accounts.value.find(a => a.id === id)
+    try {
+      const settings = await api.get(`/api/accounts/${id}/settings`).catch(() => ({}))
+      await api.post(`/api/control/run-daily/${id}`, { settings })
+      addLog(`[${acc?.name || id}] 每日任务已触发`, 'success')
+    } catch (e) {
+      addLog(`[${acc?.name || id}] 每日任务失败: ${e.message}`, 'error')
+    }
+  }
+}
+
+async function runBatch(operation, label) {
+  if (selectedIds.value.size === 0) return toast.show('请选择账号')
+  running.value = true
+  addLog()
+
+  for (const id of selectedIds.value) {
+    const acc = accounts.value.find(a => a.id === id)
+    const name = acc?.name || id.slice(0, 8)
+    try {
+      addLog()
+      await api.post()
+      addLog(, 'success')
+    } catch (e) {
+      addLog(, 'error')
+    }
+    await new Promise(r => setTimeout(r, 500))
+  }
+
+  addLog(, 'success')
+  running.value = false
+}
+
+function addLog(message, type = 'info') {
+  logs.value.push({ time: new Date().toLocaleTimeString(), message, type })
+  if (logs.value.length > 200) logs.value.shift()
+  nextTick(() => {
+    if (logListRef.value) logListRef.value.scrollTop = logListRef.value.scrollHeight
+  })
+}
+
+watch(logs, () => {
+  nextTick(() => {
+    if (logListRef.value) logListRef.value.scrollTop = logListRef.value.scrollHeight
+  })
+}, { deep: true })
+</script>
+
+<style scoped>
+.dashboard-page {
+  padding: 20px;
+  min-height: 100vh;
+  background: var(--bg-body, #f5f6f8);
+}
+.dashboard-layout {
+  display: grid;
+  grid-template-columns: 380px 1fr;
+  gap: 16px;
+  max-width: 1400px;
+  margin: 0 auto;
+  align-items: start;
+}
+.panel {
+  background: var(--bg-card, #fff);
+  border-radius: 12px;
+  border: 1px solid var(--border, #e5e5e5);
+  box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+  overflow: hidden;
+}
+.panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border, #e5e5e5);
+}
+.panel-header h2 {
+  font-size: 16px;
+  font-weight: 700;
+  margin: 0;
+}
+.panel-actions {
+  display: flex;
+  gap: 8px;
+}
+.account-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border, #e5e5e5);
+}
+.check-all {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 600;
+}
+.check-all input { width: 16px; height: 16px; cursor: pointer; }
+.selected-count {
+  font-size: 13px;
+  color: var(--text-muted, #999);
+  margin-left: auto;
+}
+.account-list {
+  max-height: calc(100vh - 220px);
+  overflow-y: auto;
+}
+.account-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border, #f0f0f0);
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.account-row:hover { background: var(--bg-body, #f5f6f8); }
+.account-row.selected { background: var(--primary-light, rgba(22,119,255,0.08)); }
+.account-row input { width: 16px; height: 16px; cursor: pointer; }
+.account-avatar-sm {
+  width: 36px;
+  height: 36px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  font-weight: 700;
+  font-size: 14px;
+  flex-shrink: 0;
+}
+.account-main {
+  flex: 1;
+  min-width: 0;
+}
+.account-name-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.account-name {
+  font-size: 14px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.status-tag {
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 10px;
+  font-weight: 600;
+}
+.status-online { background: var(--success-light, #e6f7e6); color: var(--success, #52c41a); }
+.status-offline { background: var(--text-muted-light, #f0f0f0); color: var(--text-muted, #999); }
+.account-meta-sm {
+  font-size: 12px;
+  color: var(--text-muted, #999);
+  margin-top: 2px;
+}
+.account-row-actions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.tab-bar {
+  display: flex;
+  gap: 4px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border, #e5e5e5);
+  overflow-x: auto;
+}
+.tab-btn {
+  flex-shrink: 0;
+  padding: 6px 14px;
+  border-radius: 20px;
+  font-size: 13px;
+  font-weight: 500;
+  border: 1px solid var(--border, #e5e5e5);
+  background: transparent;
+  color: var(--text-secondary, #666);
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.tab-btn.active {
+  background: var(--primary, #1677ff);
+  color: #fff;
+  border-color: var(--primary, #1677ff);
+}
+.op-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+  gap: 10px;
+  padding: 16px;
+}
+.op-btn {
+  padding: 10px 12px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  border: 1px solid var(--border, #e5e5e5);
+  background: var(--bg-card, #fff);
+  color: var(--text, #333);
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.op-btn:hover:not(:disabled) { border-color: var(--primary, #1677ff); color: var(--primary, #1677ff); }
+.op-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.op-btn.danger { border-color: var(--danger, #ff4d4f); color: var(--danger, #ff4d4f); }
+.log-panel { margin-top: 16px; }
+.log-list {
+  max-height: 320px;
+  overflow-y: auto;
+  padding: 12px 16px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.log-line { display: flex; gap: 8px; }
+.log-time { color: var(--text-muted, #999); flex-shrink: 0; }
+.log-line.success { color: var(--success, #52c41a); }
+.log-line.error { color: var(--danger, #ff4d4f); }
+.log-line.info { color: var(--text, #333); }
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 48px;
+  color: var(--text-muted, #999);
+}
+</style>

@@ -1,0 +1,967 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>niaoge cloud bot</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0b1119;color:#c8d6e5;min-height:100vh}
+.app{max-width:960px;margin:0 auto;padding:16px}
+
+/* header */
+.header{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px}
+.header h1{font-size:20px;color:#ffd700;letter-spacing:1px}
+.header .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#4caf50;margin-right:6px;animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+
+/* tabs */
+.tab-bar{display:flex;gap:4px;margin-bottom:14px;background:#111c2a;border-radius:8px;padding:3px}
+.tab-btn{flex:1;background:transparent;color:#7a8b9e;border:none;padding:9px 0;border-radius:6px;cursor:pointer;font-size:13px;transition:all .2s}
+.tab-btn.active{background:#1e3550;color:#fff}
+.tab-btn:hover:not(.active){color:#a0b4cc}
+
+/* panels */
+.panel{background:#111c2a;border-radius:10px;padding:18px;margin-bottom:14px}
+.panel-title{font-size:14px;font-weight:600;color:#8ab4f8;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center}
+.panel-title .badge{background:#1e3550;color:#8ab4f8;font-size:11px;padding:2px 8px;border-radius:10px}
+
+/* stats grid */
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:14px}
+.stat-card{background:#111c2a;border-radius:10px;padding:16px;text-align:center}
+.stat-val{font-size:28px;font-weight:700}
+.stat-label{font-size:11px;color:#7a8b9e;margin-top:4px}
+.stat-val.green{color:#4caf50} .stat-val.blue{color:#4fc3f7} .stat-val.yellow{color:#ffd700} .stat-val.red{color:#ef5350}
+
+/* buttons */
+.btn{padding:7px 16px;border-radius:5px;border:none;cursor:pointer;font-size:12px;font-weight:500;transition:all .15s}
+.btn-sm{padding:4px 10px;font-size:11px}
+.btn-xs{padding:2px 8px;font-size:10px}
+.btn-blue{background:#1e5090;color:#fff}.btn-blue:hover{background:#2565b3}
+.btn-green{background:#1b5e20;color:#fff}.btn-green:hover{background:#237028}
+.btn-red{background:#6b1c1c;color:#fff}.btn-red:hover{background:#8a2424}
+.btn-orange{background:#8a5a00;color:#fff}.btn-orange:hover{background:#a86e00}
+.btn-gray{background:#263544;color:#a0b4cc}
+.btn-group{display:flex;gap:6px;flex-wrap:wrap}
+
+/* upload zone */
+.upload-zone{border:2px dashed #1e3550;border-radius:10px;padding:30px;text-align:center;cursor:pointer;transition:border-color .2s;margin-bottom:12px}
+.upload-zone:hover,.upload-zone.dragover{border-color:#4fc3f7;background:#0d1a2a}
+.upload-zone .icon{font-size:36px;margin-bottom:8px}
+.upload-zone .text{font-size:13px;color:#7a8b9e}
+.upload-zone .text b{color:#8ab4f8}
+.upload-zone .hint{font-size:11px;color:#4a5a6a;margin-top:6px}
+.upload-zone input[type=file]{display:none}
+
+/* account card */
+.acc-card{display:flex;align-items:center;padding:10px 0;border-bottom:1px solid #171f2e;gap:10px}
+.acc-card:last-child{border-bottom:none}
+.acc-dot{width:9px;height:9px;border-radius:50%;flex-shrink:0}
+.acc-dot.on{background:#4caf50;box-shadow:0 0 6px #4caf5080}
+.acc-dot.off{background:#ef5350;box-shadow:0 0 6px #ef535080}
+.acc-dot.busy{background:#ff9800;box-shadow:0 0 6px #ff980080}
+.acc-info{flex:1;min-width:0}
+.acc-name{font-weight:600;font-size:14px}
+.acc-meta{font-size:11px;color:#6a7d8e;margin-top:2px;display:flex;gap:10px;flex-wrap:wrap}
+.acc-actions{display:flex;gap:4px;flex-shrink:0}
+
+/* schedule card */
+.sch-card{display:flex;align-items:center;padding:10px 0;border-bottom:1px solid #171f2e;gap:10px}
+.sch-card:last-child{border-bottom:none}
+.sch-status{width:9px;height:9px;border-radius:50%;flex-shrink:0}
+.sch-status.on{background:#4caf50} .sch-status.off{background:#6a7d8e}
+.sch-info{flex:1;min-width:0}
+.sch-name{font-weight:600;font-size:13px}
+.sch-cron{font-size:11px;color:#4fc3f7;font-family:monospace;margin-top:2px}
+
+/* settings grid */
+.settings-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:8px}
+.setting-row{display:flex;align-items:center;gap:8px;font-size:13px}
+.setting-row label{flex:1;cursor:pointer}
+
+/* toggle switch */
+.toggle{position:relative;width:36px;height:20px;flex-shrink:0}
+.toggle input{opacity:0;width:0;height:0}
+.toggle .slider{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:#263544;border-radius:10px;transition:.2s}
+.toggle .slider:before{content:"";position:absolute;height:14px;width:14px;left:3px;bottom:3px;background:#7a8b9e;border-radius:50%;transition:.2s}
+.toggle input:checked+.slider{background:#1e5090}
+.toggle input:checked+.slider:before{transform:translateX(16px);background:#fff}
+
+/* log panel */
+.log-feed{max-height:320px;overflow-y:auto;background:#0b1119;border-radius:6px;padding:10px;font:12px/1.6 monospace}
+.log-line{padding:2px 0;border-bottom:1px solid #111c2a}
+.log-line .time{color:#4a5a6a;margin-right:8px;font-size:10px}
+.log-line.warn{color:#ff9800} .log-line.err{color:#ef5350} .log-line.ok{color:#4caf50}
+
+/* quick cron presets */
+.preset-row{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}
+.preset-tag{background:#1e3550;border:1px solid transparent;color:#8ab4f8;padding:4px 10px;border-radius:4px;font-size:11px;cursor:pointer}
+.preset-tag:hover{border-color:#4fc3f7;color:#fff}
+.preset-tag.active{background:#1e5090;border-color:#4fc3f7;color:#fff}
+
+/* modal */
+.modal-mask{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.7);display:flex;align-items:center;justify-content:center;z-index:100}
+.modal-box{background:#111c2a;border-radius:12px;padding:24px;min-width:400px;max-width:90vw;max-height:80vh;overflow-y:auto}
+.modal-title{font-size:16px;font-weight:600;color:#ffd700;margin-bottom:16px}
+.modal-close{float:right;background:none;border:none;color:#7a8b9e;font-size:20px;cursor:pointer}
+
+/* progress bar */
+.progress-bar{height:4px;background:#1e3550;border-radius:2px;margin:8px 0;overflow:hidden}
+.progress-fill{height:100%;background:#4fc3f7;transition:width .3s;border-radius:2px}
+
+/* toast */
+.toast{position:fixed;top:16px;right:16px;z-index:200;display:flex;flex-direction:column;gap:6px}
+.toast-item{padding:10px 18px;border-radius:6px;font-size:13px;animation:slideIn .2s ease;max-width:360px}
+.toast-item.info{background:#1e3550;color:#c8d6e5}
+.toast-item.success{background:#1b3a1b;color:#81c784}
+.toast-item.error{background:#3a1b1b;color:#ef9a9a}
+@keyframes slideIn{from{transform:translateX(100px);opacity:0}to{transform:translateX(0);opacity:1}}
+
+@media(max-width:600px){
+  .stats{grid-template-columns:repeat(2,1fr)}
+  .settings-grid{grid-template-columns:1fr}
+  .modal-box{min-width:auto;padding:16px}
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="header">
+    <h1><span class="dot"></span>niaoge cloud bot</h1>
+    <span style="font-size:11px;color:#4a5a6a" id="srvTime"></span>
+  </div>
+
+  <!-- Stats Row -->
+  <div class="stats" id="statsRow">
+    <div class="stat-card"><div class="stat-val blue" id="statTotal">-</div><div class="stat-label">总账号</div></div>
+    <div class="stat-card"><div class="stat-val green" id="statConn">-</div><div class="stat-label">已连接</div></div>
+    <div class="stat-card"><div class="stat-val yellow" id="statSch">-</div><div class="stat-label">定时任务</div></div>
+    <div class="stat-card"><div class="stat-val red" id="statLogs">-</div><div class="stat-label">今日执行</div></div>
+  </div>
+
+  <!-- Tab Bar -->
+  <div class="tab-bar">
+    <button class="tab-btn active" data-tab="dash">🏠 总览</button>
+    <button class="tab-btn" data-tab="accounts">👤 账号</button>
+    <button class="tab-btn" data-tab="tasks">⚙️ 任务设置</button>
+    <button class="tab-btn" data-tab="batch">🚀 批量操作</button>
+    <button class="tab-btn" data-tab="game">🎮 游戏功能</button>
+    <button class="tab-btn" data-tab="schedules">🕐 定时调度</button>
+    <button class="tab-btn" data-tab="logs">📋 日志</button>
+  </div>
+
+  <!-- TAB: 总览 -->
+  <div id="tab-dash" class="tab-content">
+    <div class="panel">
+      <div class="panel-title">快捷操作 <span class="badge">批量</span></div>
+      <div class="btn-group">
+        <button class="btn btn-green" onclick="batchConnect()">🔌 一键连接全部</button>
+        <button class="btn btn-blue" onclick="batchRunDaily()">▶ 一键执行每日</button>
+        <button class="btn btn-red" onclick="batchDisconnect()">⏹ 一键断开全部</button>
+        <button class="btn btn-orange" onclick="reloadSchedules()">🔄 重载定时任务</button>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-title">账号概览</div>
+      <div id="dashAccList"></div>
+      <div id="dashEmpty" class="upload-zone" style="padding:24px;border-style:dashed">
+        <div class="icon">📂</div>
+        <div class="text">还没有账号，<b>点击上传 BIN 文件</b></div>
+        <div class="hint">支持打开微信咸鱼之王抓取的 .bin 文件，一次可传多个</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- TAB: 账号管理 -->
+  <div id="tab-accounts" class="tab-content" style="display:none">
+    <!-- Upload Zone -->
+    <div class="upload-zone" id="uploadZone" onclick="document.getElementById('fileInput').click()">
+      <div class="icon">⬆️</div>
+      <div class="text"><b>点击上传</b> 或拖拽 BIN 文件到此区域</div>
+      <div class="hint">支持 .bin 文件，一次可上传多个（Ctrl+点击多选）</div>
+      <input type="file" id="fileInput" accept=".bin" multiple hidden>
+    </div>
+
+    <!-- Upload progress -->
+    <div id="uploadProgress" style="display:none;padding:12px;background:#111c2a;border-radius:8px;margin-bottom:12px">
+      <div id="uploadMsg" style="font-size:13px"></div>
+      <div class="progress-bar"><div class="progress-fill" id="uploadBar" style="width:0"></div></div>
+    </div>
+
+    <!-- Account List -->
+    <div class="panel">
+      <div class="panel-title">账号列表 <span class="badge" id="accCount">0</span></div>
+      <div id="accList"></div>
+      <div id="accEmpty" style="text-align:center;padding:24px;color:#4a5a6a;font-size:13px">暂无账号 — 上传 BIN 文件开始</div>
+    </div>
+  </div>
+
+  <!-- TAB: 任务设置 -->
+  <div id="tab-tasks" class="tab-content" style="display:none">
+    <div class="panel">
+      <div class="panel-title">选择账号 <span class="badge" id="taskAccBadge">未选择</span></div>
+      <div id="taskAccSelect" class="btn-group" style="margin-bottom:12px"></div>
+      <div id="taskSettingsPanel" style="display:none">
+        <div class="settings-grid" id="taskSettingsGrid"></div>
+        <div style="margin-top:14px">
+          <button class="btn btn-green" onclick="saveTaskSettings()">💾 保存设置</button>
+          <span id="taskSettingsSaved" style="color:#4caf50;font-size:12px;margin-left:10px;display:none">✓ 已保存</span>
+        </div>
+      </div>
+      <div id="taskNoAcc" style="text-align:center;padding:24px;color:#4a5a6a;font-size:13px">请先从上方选择账号</div>
+    </div>
+  </div>
+
+  <!-- TAB: 批量操作 -->
+  <div id="tab-batch" class="tab-content" style="display:none">
+    <!-- 账号选择 -->
+    <div class="panel">
+      <div class="panel-title">选择操作账号</div>
+      <div id="batchAccCheckboxes" class="btn-group" style="margin-bottom:8px"></div>
+      <div style="font-size:11px;color:#6a7d8e">
+        已选: <span id="batchSelectedCount" style="color:#4fc3f7">0</span> 个 | 
+        <a href="#" onclick="batchSelectAll();return false" style="color:#8ab4f8">全选</a> ·
+        <a href="#" onclick="batchSelectConn();return false" style="color:#8ab4f8">已连接</a> ·
+        <a href="#" onclick="batchSelectNone();return false" style="color:#ef5350">取消</a>
+      </div>
+    </div>
+
+    <!-- 批量操作组: 副本 -->
+    <div class="panel">
+      <div class="panel-title">🗡️ 副本 <span class="badge">日常</span></div>
+      <div class="btn-group">
+        <button class="btn btn-sm btn-green" onclick="runBatchOp('dungeonBaoku13')">宝库1-3层</button>
+        <button class="btn btn-sm btn-green" onclick="runBatchOp('dungeonBaoku45')">宝库4-5层</button>
+        <button class="btn btn-sm btn-blue" onclick="runBatchOp('dungeonMengjing')">咸王梦境</button>
+        <button class="btn btn-sm btn-orange" onclick="runBatchOp('dungeonBuyDreamItems')">梦境商品</button>
+      </div>
+    </div>
+
+    <!-- 批量操作组: 怪异塔 -->
+    <div class="panel">
+      <div class="panel-title">🗼 怪异塔</div>
+      <div class="btn-group">
+        <button class="btn btn-sm btn-green" onclick="runBatchOp('towerClimb')">一键爬塔</button>
+        <button class="btn btn-sm btn-blue" onclick="runBatchOp('towerClimbWeird')">爬怪异塔</button>
+        <button class="btn btn-sm btn-orange" onclick="runBatchOp('towerClaimFreeEnergy')">免费道具</button>
+      </div>
+    </div>
+
+    <!-- 批量操作组: 资源 -->
+    <div class="panel">
+      <div class="panel-title">📦 资源</div>
+      <div class="btn-group">
+        <button class="btn btn-sm btn-green" onclick="runBatchOp('carSmartSend')">智能发车</button>
+        <button class="btn btn-sm btn-blue" onclick="runBatchOp('carClaimAll')">一键收车</button>
+        <button class="btn btn-sm btn-green" onclick="runBatchOp('itemOpenBox')">批量开箱</button>
+        <button class="btn btn-sm btn-blue" onclick="runBatchOp('itemClaimBoxPoint')">宝箱积分</button>
+        <button class="btn btn-sm btn-blue" onclick="runBatchOp('itemFish')">批量钓鱼</button>
+        <button class="btn btn-sm btn-green" onclick="runBatchOp('itemRecruit')">批量招募</button>
+        <button class="btn btn-sm btn-blue" onclick="runBatchOp('itemGenieSweep')">灯神扫荡</button>
+        <button class="btn btn-sm btn-orange" onclick="runBatchOp('itemClaimPeach')">蟠桃园任务</button>
+        <button class="btn btn-sm btn-orange" onclick="runBatchOp('itemHeroUpgrade')">英雄升星</button>
+        <button class="btn btn-sm btn-orange" onclick="runBatchOp('itemBookUpgrade')">图鉴升星</button>
+        <button class="btn btn-sm btn-gray" onclick="runBatchOp('itemClaimBookReward')">图鉴奖励</button>
+      </div>
+    </div>
+
+    <!-- 批量操作组: 功法 -->
+    <div class="panel">
+      <div class="panel-title">📜 功法</div>
+      <div class="btn-group">
+        <button class="btn btn-sm btn-green" onclick="runBatchOp('legacyClaim')">领取残卷</button>
+        <button class="btn btn-sm btn-blue" onclick="runBatchOp('legacyGiftSend')">赠送残卷</button>
+      </div>
+    </div>
+
+    <!-- 批量操作组: 月度 -->
+    <div class="panel">
+      <div class="panel-title">📅 月度</div>
+      <div class="btn-group">
+        <button class="btn btn-sm btn-green" onclick="runBatchOp('monthlyTopUpFish')">钓鱼补齐(320)</button>
+        <button class="btn btn-sm btn-blue" onclick="runBatchOp('monthlyTopUpArena')">竞技场补齐(240)</button>
+      </div>
+    </div>
+
+    <!-- 批量操作组: 俱乐部 -->
+    <div class="panel">
+      <div class="panel-title">🛡️ 俱乐部</div>
+      <div class="btn-group">
+        <button class="btn btn-sm btn-green" onclick="runBatchOp('clubSignin')">俱乐部签到</button>
+        <button class="btn btn-sm btn-blue" onclick="runBatchOp('clubResearch')">俱乐部研究</button>
+        <button class="btn btn-sm btn-blue" onclick="runBatchOp('clubApproveAll')">审批申请</button>
+        <button class="btn btn-sm btn-green" onclick="runBatchOp('clubSignupMatch')">排位报名</button>
+        <button class="btn btn-sm btn-orange" onclick="runBatchOp('clubWarGuess')">月赛助威</button>
+      </div>
+    </div>
+
+    <!-- 批量操作组: 商店 -->
+    <div class="panel">
+      <div class="panel-title">💰 商店</div>
+      <div class="btn-group">
+        <button class="btn btn-sm btn-green" onclick="runBatchOp('storeFourGuardians')">四圣碎片</button>
+        <button class="btn btn-sm btn-blue" onclick="runBatchOp('storeSkinCoins')">皮肤币x5</button>
+        <button class="btn btn-sm btn-green" onclick="runBatchOp('storeQuickPurchase')">黑市采购</button>
+        <button class="btn btn-sm btn-blue" onclick="runBatchOp('storeCollectionFree')">珍宝阁</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- TAB: 游戏功能 -->
+  <div id="tab-game" class="tab-content" style="display:none">
+    <!-- 账号选择 -->
+    <div class="panel">
+      <div class="panel-title">选择账号查看</div>
+      <div id="gameAccSelect" class="btn-group" style="margin-bottom:8px"></div>
+    </div>
+
+    <!-- 游戏功能二级TAB -->
+    <div class="tab-bar" id="gameSubTabBar" style="background:#0b1119;margin-bottom:10px">
+      <button class="tab-btn active" data-gtab="daily">🗓️ 日常</button>
+      <button class="tab-btn" data-gtab="club">🛡️ 俱乐部</button>
+      <button class="tab-btn" data-gtab="activity">🎪 活动</button>
+      <button class="tab-btn" data-gtab="saltField">⚔️ 盐场</button>
+      <button class="tab-btn" data-gtab="peach">🍑 蟠桃园</button>
+      <button class="tab-btn" data-gtab="rankings">🏆 排行榜</button>
+      <button class="tab-btn" data-gtab="pvp">🤼 切磋</button>
+    </div>
+
+    <!-- 游戏功能内容区 -->
+    <div id="gameFeatureContent" style="text-align:center;padding:30px;color:#6a7d8e">
+      请先选择账号并连接，然后点击查询
+    </div>
+  </div>
+
+  <!-- TAB: 定时调度 -->
+  <div id="tab-schedules" class="tab-content" style="display:none">
+    <div class="panel">
+      <div class="panel-title">快捷预设</div>
+      <div class="preset-row" id="presetRow">
+        <span class="preset-tag" data-cron="0 5 * * *">每天 05:00</span>
+        <span class="preset-tag" data-cron="0 9 * * *">每天 09:00</span>
+        <span class="preset-tag" data-cron="0 12 * * *">每天 12:00</span>
+        <span class="preset-tag" data-cron="0 18 * * *">每天 18:00</span>
+        <span class="preset-tag" data-cron="0 21 * * *">每天 21:00</span>
+        <span class="preset-tag" data-cron="0 5,18 * * *">早晚 05:00 + 18:00</span>
+        <span class="preset-tag" data-cron="0 */4 * * *">每4小时</span>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-title">添加定时任务</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px">
+        <input type="text" id="schName" placeholder="任务名称" style="background:#0b1119;border:1px solid #1e3550;color:#c8d6e5;padding:8px;border-radius:5px;font-size:13px">
+        <input type="text" id="schCron" placeholder="Cron 表达式" style="background:#0b1119;border:1px solid #1e3550;color:#c8d6e5;padding:8px;border-radius:5px;font-size:13px;font-family:monospace">
+      </div>
+      <button class="btn btn-green" onclick="addSchedule()">➕ 添加定时任务</button>
+    </div>
+    <div class="panel">
+      <div class="panel-title">调度列表</div>
+      <div id="schList"></div>
+      <div id="schEmpty" style="text-align:center;padding:24px;color:#4a5a6a;font-size:13px">暂无定时任务</div>
+    </div>
+  </div>
+
+  <!-- TAB: 日志 -->
+  <div id="tab-logs" class="tab-content" style="display:none">
+    <div class="panel">
+      <div class="panel-title">
+        实时日志 <span class="badge" style="background:#1b5e20">SSE</span>
+        <div class="btn-group">
+          <button class="btn btn-sm btn-red" onclick="clearLogs()">清屏</button>
+          <button class="btn btn-sm btn-blue" onclick="toggleSSE()">SSE: <span id="sseLabel">ON</span></button>
+        </div>
+      </div>
+      <div class="log-feed" id="logFeed"></div>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toastContainer"></div>
+
+<script>
+// ==================== API ====================
+const API = {
+  async get(u){const r=await fetch(u);if(!r.ok)throw new Error((await r.json()).error);return r.json()},
+  async post(u,d){const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)});const j=await r.json();if(!r.ok)throw new Error(j.error||'failed');return j},
+  async put(u,d){const r=await fetch(u,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)});const j=await r.json();if(!r.ok)throw new Error(j.error||'failed');return j},
+  async del(u){const r=await fetch(u,{method:'DELETE'});if(!r.ok)throw new Error((await r.json()).error);return r.json()},
+  async upload(u,form){const r=await fetch(u,{method:'POST',body:form});const j=await r.json();if(!r.ok)throw new Error(j.error||'failed');return j},
+};
+function toast(msg,type='info'){const c=document.getElementById('toastContainer');const d=document.createElement('div');d.className='toast-item '+type;d.textContent=msg;c.appendChild(d);setTimeout(()=>{d.remove()},3500)}
+function esc(s){const d=document.createElement('div');d.textContent=s||'';return d.innerHTML}
+
+let accounts=[],settingsCache={},selectedTaskAcc=null,currentSettings=null;
+let sseSource=null,sseActive=true;
+
+// ==================== INIT ====================
+let batchSelectedIds=new Set();
+async function loadAll(){
+  try{const d=await API.get('/api/control/dashboard');accounts=d.accounts;renderStats(d);renderDashAccs();renderAccList();renderSchList();renderTaskAccSelect();renderBatchAccSelect();document.getElementById('taskAccBadge').textContent='未选择'}catch(e){console.error(e)}
+}
+function renderStats(d){
+  document.getElementById('statTotal').textContent=d.total;
+  document.getElementById('statConn').textContent=d.connected;
+  document.getElementById('statSch').textContent=d.schedules;
+  document.getElementById('statLogs').textContent=d.recentLogs.length||0;
+  document.getElementById('srvTime').textContent='🕐 '+new Date().toLocaleTimeString();
+}
+
+// ==================== UPLOAD ZONE ====================
+const uploadZone=document.getElementById('uploadZone');
+const fileInput=document.getElementById('fileInput');
+['dragenter','dragover'].forEach(e=>uploadZone.addEventListener(e,ev=>{ev.preventDefault();uploadZone.classList.add('dragover')}));
+['dragleave','drop'].forEach(e=>uploadZone.addEventListener(e,ev=>{ev.preventDefault();uploadZone.classList.remove('dragover')}));
+uploadZone.addEventListener('drop',e=>handleFiles(e.dataTransfer.files));
+fileInput.addEventListener('change',()=>handleFiles(fileInput.files));
+
+async function handleFiles(fileList){
+  if(!fileList.length)return;
+  const bins=[...fileList].filter(f=>f.name.toLowerCase().endsWith('.bin'));
+  if(!bins.length){toast('请选择 .bin 文件','error');return}
+
+  const prog=document.getElementById('uploadProgress');
+  const msg=document.getElementById('uploadMsg');
+  const bar=document.getElementById('uploadBar');
+  prog.style.display='block';
+  bar.style.width='0';
+
+  let added=0,existed=0,errors=0;
+  for(let i=0;i<bins.length;i++){
+    const f=bins[i];
+    msg.textContent=`处理中: ${f.name} (${i+1}/${bins.length})`;
+    bar.style.width=Math.floor((i/bins.length)*100)+'%';
+    try{
+      // 1. 先预览获取服务器列表
+      const form=new FormData();
+      form.append('binFile',f);
+      const preview=await API.upload('/api/accounts/preview',form);
+
+      // 2. 如果有多个角色让用户选择
+      let serverId='',platform='hortor',platformExt='mix';
+      if(preview.roles&&preview.roles.length>1){
+        const chosen=await showRoleModal(f.name,preview.roles);
+        if(!chosen){errors++;continue}
+        serverId=chosen.serverId;
+        platform=chosen.platform;
+        platformExt=chosen.platformExt;
+      }else if(preview.roles&&preview.roles.length===1){
+        const r=preview.roles[0];
+        serverId=r.serverId;platform=r.platform;platformExt=r.platformExt;
+      }
+
+      // 3. 确认添加
+      const confirmForm=new FormData();
+      confirmForm.append('binFile',f);
+      confirmForm.append('name',f.name.replace(/\.bin$/i,''));
+      confirmForm.append('serverId',serverId);
+      confirmForm.append('platform',platform);
+      confirmForm.append('platformExt',platformExt);
+      const r=await API.upload('/api/accounts/confirm',confirmForm);
+      if(r.success)added++;
+    }catch(e){
+      if(e.message.includes('已存在')){existed++;continue}
+      errors++;toast(`${f.name}: ${e.message}`,'error');
+    }
+  }
+  bar.style.width='100%';
+  setTimeout(()=>{prog.style.display='none'},1500);
+  if(added>0)toast(`✅ 成功添加 ${added} 个账号`+(existed?`, ${existed} 个已存在`:''),'success');
+  else if(existed>0)toast(`全部 ${existed} 个账号已存在`,'info');
+  else if(errors>0)toast(`添加失败`, 'error');
+  fileInput.value='';
+  loadAll();
+}
+
+// ==================== ROLE SELECTION MODAL ====================
+function showRoleModal(fileName,roles){
+  return new Promise(resolve=>{
+    const mask=document.createElement('div');
+    mask.className='modal-mask';
+    mask.innerHTML=`<div class="modal-box">
+      <div class="modal-title">选择角色 - ${esc(fileName)}<button class="modal-close" id="roleModalClose">&times;</button></div>
+      <div style="max-height:300px;overflow-y:auto">
+        ${roles.map((r,i)=>`<div class="role-option" data-idx="${i}" style="padding:10px;border-radius:6px;cursor:pointer;margin-bottom:4px;background:#0b1119;border:1px solid #1e3550;transition:all .15s" onmouseenter="this.style.borderColor='#4fc3f7'" onmouseleave="this.style.borderColor='#1e3550'">
+          <div style="font-weight:600;font-size:14px">${esc(r.name)}</div>
+          <div style="font-size:11px;color:#6a7d8e;margin-top:2px">Lv${r.level||0} · ${r.serverId||'?'} · ${r.platform||'hortor'}</div>
+        </div>`).join('')}
+      </div>
+      <div style="margin-top:12px"><button class="btn btn-gray" id="roleSkipBtn">跳过(用默认)</button></div>
+    </div>`;
+    document.body.appendChild(mask);
+
+    const close=()=>{mask.remove();resolve(null)};
+    mask.querySelector('#roleModalClose').onclick=close;
+    mask.querySelector('#roleSkipBtn').onclick=close;
+    mask.addEventListener('click',e=>{if(e.target===mask)close()});
+
+    mask.querySelectorAll('.role-option').forEach(el=>{
+      el.onclick=()=>{
+        const r=roles[parseInt(el.dataset.idx)];
+        mask.remove();
+        resolve(r);
+      };
+    });
+  });
+}
+
+// ==================== ACCOUNT LIST ====================
+function renderDashAccs(){
+  const el=document.getElementById('dashAccList');
+  const emp=document.getElementById('dashEmpty');
+  if(!accounts.length){el.innerHTML='';emp.style.display='block';return}
+  emp.style.display='none';
+  el.innerHTML=accounts.map(a=>`<div class="acc-card">
+    <div class="acc-dot ${a.connected?'on':'off'}"></div>
+    <div class="acc-info">
+      <div class="acc-name">${esc(a.name)}</div>
+      <div class="acc-meta">
+        <span>Lv${a.level||0}</span><span>${esc(a.role_name||'?')}</span><span>${a.status}</span>
+        ${a.last_login?`<span>最后:${new Date(a.last_login).toLocaleDateString()}</span>`:''}
+      </div>
+    </div>
+    <div class="acc-actions">
+      ${a.connected
+        ?`<button class="btn btn-sm btn-red" onclick="disconnectAcc('${a.id}')">断开</button><button class="btn btn-sm btn-green" onclick="runDailyAcc('${a.id}')">执行</button>`
+        :`<button class="btn btn-sm btn-green" onclick="connectAcc('${a.id}')">连接</button>`}
+      <button class="btn btn-sm btn-gray" onclick="refreshToken('${a.id}')" title="刷新Token">↻</button>
+      <button class="btn btn-sm btn-red" onclick="removeAcc('${a.id}')">✕</button>
+    </div>
+  </div>`).join('');
+}
+
+function renderAccList(){
+  document.getElementById('accCount').textContent=accounts.length;
+  document.getElementById('accList').innerHTML=accounts.length?document.getElementById('dashAccList').innerHTML:'';
+  document.getElementById('accEmpty').style.display=accounts.length?'none':'block';
+}
+
+async function connectAcc(id){try{await API.post(`/api/control/connect/${id}`);toast('连接成功','success');loadAll()}catch(e){toast(e.message,'error')}}
+async function disconnectAcc(id){try{await API.post(`/api/control/disconnect/${id}`);toast('已断开','info');loadAll()}catch(e){toast(e.message,'error')}}
+async function runDailyAcc(id){try{await API.post(`/api/control/run-daily/${id}`);toast('任务已开始，请查看日志','info')}catch(e){toast(e.message,'error')}}
+async function removeAcc(id){if(!confirm('确定删除?'))return;try{await API.del(`/api/accounts/${id}`);toast('已删除','info');loadAll()}catch(e){toast(e.message,'error')}}
+async function refreshToken(id){try{await API.post(`/api/accounts/${id}/refresh-token`);toast('Token已刷新','success')}catch(e){toast(e.message,'error')}}
+
+// ==================== BATCH OPS ====================
+async function batchConnect(){try{await API.post('/api/control/connect-all');toast('开始批量连接','info')}catch(e){toast(e.message,'error')}}
+async function batchRunDaily(){try{await API.post('/api/control/run-daily-all');toast('开始批量执行每日任务','info')}catch(e){toast(e.message,'error')}}
+async function batchDisconnect(){try{await API.post('/api/control/disconnect-all');toast('已全部断开','info');loadAll()}catch(e){toast(e.message,'error')}}
+async function reloadSchedules(){try{await API.post('/api/control/reload-schedules');toast('定时任务已重载','success')}catch(e){toast(e.message,'error')}}
+
+// ==================== TASK SETTINGS ====================
+function renderTaskAccSelect(){
+  const el=document.getElementById('taskAccSelect');
+  el.innerHTML=accounts.map(a=>`<button class="btn btn-sm ${selectedTaskAcc===a.id?'btn-blue':'btn-gray'}" onclick="selectTaskAcc('${a.id}')">${esc(a.name)}</button>`).join('');
+}
+
+async function selectTaskAcc(id){
+  selectedTaskAcc=id;
+  document.getElementById('taskAccBadge').textContent=accounts.find(a=>a.id===id)?.name||id;
+  document.getElementById('taskNoAcc').style.display='none';
+  document.getElementById('taskSettingsPanel').style.display='block';
+  document.getElementById('taskSettingsSaved').style.display='none';
+
+  // load settings
+  try{
+    const s=await API.get(`/api/accounts/${id}/settings`);
+    currentSettings=s;
+    renderTaskSettings();
+    renderTaskAccSelect();
+  }catch(e){toast(e.message,'error')}
+}
+
+const TASK_TOGGLES=[
+  {key:'arenaEnable',label:'竞技场战斗 (3次)'},
+  {key:'claimHangUp',label:'挂机奖励 + 加钟x4'},
+  {key:'payRecruit',label:'付费招募'},
+  {key:'openBox',label:'开启木质宝箱 (10个)'},
+  {key:'claimBottle',label:'盐罐领取奖励'},
+  {key:'claimEmail',label:'邮件一键领取'},
+  {key:'blackMarketPurchase',label:'黑市购买'},
+  {key:'fishingEnable',label:'免费钓鱼 (3次)'},
+  {key:'genieSweepEnable',label:'四国灯神扫荡 + 扫荡卷'},
+  {key:'dungeonEnable',label:'咸王梦境 + 深海灯神'},
+];
+const TASK_NUMBERS=[
+  {key:'arenaFormation',label:'竞技场阵容',min:1,max:9},
+  {key:'bossFormation',label:'BOSS阵容',min:1,max:9},
+  {key:'bossTimes',label:'军团BOSS次数',min:0,max:10},
+  {key:'commandDelay',label:'命令延迟(ms)',min:100,max:5000,step:100},
+  {key:'taskDelay',label:'任务间隔(ms)',min:100,max:5000,step:100},
+];
+
+function renderTaskSettings(){
+  if(!currentSettings)return;
+  let html='';
+  for(const t of TASK_TOGGLES){
+    html+=`<div class="setting-row">
+      <label class="toggle"><input type="checkbox" ${currentSettings[t.key]?'checked':''} onchange="currentSettings['${t.key}']=this.checked">
+      <span class="slider"></span></label><label>${t.label}</label></div>`;
+  }
+  for(const t of TASK_NUMBERS){
+    html+=`<div class="setting-row">
+      <label>${t.label}</label>
+      <input type="number" value="${currentSettings[t.key]||0}" min="${t.min}" max="${t.max}" step="${t.step||1}" style="width:70px;background:#0b1119;border:1px solid #1e3550;color:#c8d6e5;padding:4px;border-radius:4px;font-size:12px" onchange="currentSettings['${t.key}']=parseInt(this.value)">
+    </div>`;
+  }
+  document.getElementById('taskSettingsGrid').innerHTML=html;
+}
+
+async function saveTaskSettings(){
+  if(!selectedTaskAcc||!currentSettings)return;
+  try{
+    await API.put(`/api/accounts/${selectedTaskAcc}/settings`,currentSettings);
+    document.getElementById('taskSettingsSaved').style.display='inline';
+    setTimeout(()=>document.getElementById('taskSettingsSaved').style.display='none',2000);
+    toast('设置已保存','success');
+  }catch(e){toast(e.message,'error')}
+}
+
+// ==================== SCHEDULES ====================
+async function renderSchList(){
+  try{
+    const ss=await API.get('/api/control/schedules');
+    document.getElementById('schList').innerHTML=ss.map(s=>`<div class="sch-card">
+      <div class="sch-status ${s.running?'on':'off'}"></div>
+      <div class="sch-info"><div class="sch-name">${esc(s.name)}</div><div class="sch-cron">${esc(s.cron_expression)}</div></div>
+      <button class="btn btn-sm btn-red" onclick="removeSch(${s.id})">删除</button>
+    </div>`).join('');
+    document.getElementById('schEmpty').style.display=ss.length?'none':'block';
+  }catch(e){}
+}
+
+async function addSchedule(){
+  const name=document.getElementById('schName').value.trim();
+  const cron=document.getElementById('schCron').value.trim();
+  if(!name||!cron)return toast('请填写名称和Cron表达式','error');
+  try{
+    await API.post('/api/tasks',{name,cronExpression:cron,taskList:['daily'],accountIds:'*'});
+    await API.post('/api/control/reload-schedules');
+    document.getElementById('schName').value='';
+    document.getElementById('schCron').value='';
+    toast('定时任务已添加','success');
+    renderSchList();
+  }catch(e){toast(e.message,'error')}
+}
+
+async function removeSch(id){
+  if(!confirm('确定删除?'))return;
+  try{await API.del(`/api/tasks/${id}`);await API.post('/api/control/reload-schedules');renderSchList()}catch(e){toast(e.message,'error')}
+}
+
+// Cron preset click
+document.getElementById('presetRow').addEventListener('click',e=>{
+  const tag=e.target.closest('.preset-tag');
+  if(!tag)return;
+  document.getElementById('schCron').value=tag.dataset.cron;
+  document.getElementById('schName').focus();
+  document.querySelectorAll('#presetRow .preset-tag').forEach(t=>t.classList.remove('active'));
+  tag.classList.add('active');
+});
+
+// ==================== BATCH OPERATIONS ====================
+function renderBatchAccSelect(){
+  const el=document.getElementById('batchAccCheckboxes');
+  if(!el)return;
+  el.innerHTML=accounts.map(a=>{
+    const checked=batchSelectedIds.has(a.id)?' checked':'';
+    return `<label style="display:inline-flex;align-items:center;gap:4px;font-size:12px;cursor:pointer;margin-right:8px;margin-bottom:4px;background:#0b1119;padding:4px 8px;border-radius:4px;border:1px solid ${batchSelectedIds.has(a.id)?'#4fc3f7':'#1e3550'}">
+      <input type="checkbox" value="${a.id}" ${checked} onchange="toggleBatchAcc('${a.id}',this.checked)" style="accent-color:#4fc3f7">
+      ${esc(a.name)} <span style="color:${a.connected?'#4caf50':'#ef5350'};font-size:10px">${a.connected?'●':'○'}</span>
+    </label>`;
+  }).join('');
+  updateBatchCount();
+}
+function toggleBatchAcc(id,checked){
+  if(checked)batchSelectedIds.add(id);
+  else batchSelectedIds.delete(id);
+  updateBatchCount();
+  renderBatchAccSelect();
+}
+function updateBatchCount(){
+  document.getElementById('batchSelectedCount').textContent=batchSelectedIds.size;
+}
+function batchSelectAll(){
+  accounts.forEach(a=>batchSelectedIds.add(a.id));
+  renderBatchAccSelect();
+}
+function batchSelectConn(){
+  batchSelectedIds.clear();
+  accounts.forEach(a=>{if(a.connected)batchSelectedIds.add(a.id)});
+  renderBatchAccSelect();
+}
+function batchSelectNone(){
+  batchSelectedIds.clear();
+  renderBatchAccSelect();
+}
+
+async function runBatchOp(operation){
+  const ids=[...batchSelectedIds];
+  if(!ids.length){toast('请先选择账号','error');return}
+  try{
+    await API.post(`/api/batch/run-all/${operation}`,{accountIds:ids});
+    toast(`批量 ${operation} 已开始执行`,'info');
+  }catch(e){toast(e.message,'error')}
+}
+
+// ==================== GAME FEATURES ====================
+let selectedGameAcc=null;
+let activeGameTab='daily';
+let gamePollTimer=null;
+const gameResultCache={};
+
+function renderGameAccSelect(){
+  const el=document.getElementById('gameAccSelect');
+  if(!el)return;
+  el.innerHTML=accounts.map(a=>
+    `<button class="btn btn-sm ${selectedGameAcc===a.id?'btn-blue':'btn-gray'}" onclick="selectGameAcc('${a.id}')">${esc(a.name)} ${a.connected?'●':'○'}</button>`
+  ).join('');
+}
+
+function selectGameAcc(id){
+  selectedGameAcc=id;
+  renderGameAccSelect();
+  refreshGameFeature();
+}
+
+const GAME_FEATURE_QUERIES={
+  daily:[
+    {label:'角色状态',feature:'daily-status',icon:'👤'},
+    {label:'阵容',feature:'formations',icon:'⚔️'},
+    {label:'咸将塔',feature:'tower',icon:'🗼'},
+    {label:'怪异塔',feature:'weird-tower',icon:'🏯'},
+  ],
+  club:[
+    {label:'俱乐部信息',feature:'club',icon:'🏛️'},
+    {label:'成员列表',feature:'club-members',icon:'👥'},
+    {label:'入会申请',feature:'club-apply',icon:'📋'},
+    {label:'盐场排名',feature:'war-rank',icon:'🏅'},
+    {label:'本周战绩',feature:'week-battle',icon:'📊'},
+    {label:'本月战绩',feature:'month-battle',icon:'📈'},
+  ],
+  activity:[
+    {label:'月度任务',feature:'monthly',icon:'📅'},
+    {label:'答题状态',feature:'study',icon:'📝'},
+    {label:'邮件列表',feature:'mail',icon:'📬'},
+  ],
+  saltField:[
+    {label:'盐场信息',feature:'salt-field',icon:'⚔️'},
+    {label:'分组排名',feature:'salt-group-rank',icon:'🏆'},
+    {label:'战场信息',feature:'battlefield',icon:'🗺️'},
+  ],
+  peach:[
+    {label:'蟠桃园信息',feature:'peach',icon:'🍑'},
+    {label:'蟠桃战绩',feature:'peach-battle',icon:'📊'},
+  ],
+  rankings:[
+    {label:'区服榜',feature:'rank-server',icon:'📋'},
+    {label:'巅峰榜',feature:'rank-top',icon:'👑'},
+    {label:'俱乐部榜',feature:'rank-club',icon:'🏛️'},
+    {label:'黄金积分榜',feature:'rank-gold',icon:'🥇'},
+    {label:'伟大航路榜',feature:'rank-route',icon:'⛵'},
+  ],
+  pvp:[
+    {label:'竞技场对手',feature:'arena-targets',icon:'⚔️'},
+    {label:'竞技场排名',feature:'arena-rank',icon:'🏆'},
+  ],
+};
+
+function refreshGameFeature(){
+  if(!selectedGameAcc){return}
+  const queries=GAME_FEATURE_QUERIES[activeGameTab]||[];
+  if(!queries.length){
+    document.getElementById('gameFeatureContent').innerHTML='<div style="text-align:center;padding:30px;color:#6a7d8e">该分类暂无查询</div>';
+    return;
+  }
+
+  const acc=accounts.find(a=>a.id===selectedGameAcc);
+  if(!acc||!acc.connected){
+    document.getElementById('gameFeatureContent').innerHTML='<div style="text-align:center;padding:30px;color:#ef5350">请先连接该账号</div>';
+    return;
+  }
+
+  let html='<div class="panel"><div class="panel-title">查询面板</div><div class="btn-group">';
+  for(const q of queries){
+    html+=`<button class="btn btn-sm btn-green" onclick="queryGameFeature('${selectedGameAcc}','${q.feature}','${q.label}')">${q.icon} ${q.label}</button>`;
+  }
+  html+='</div></div>';
+
+  // 显示已缓存的结果
+  for(const q of queries){
+    const key=`${selectedGameAcc}:${q.feature}`;
+    const cached=gameResultCache[key];
+    if(cached){
+      html+=renderResultPanel(q.label,q.feature,cached);
+    }
+  }
+
+  document.getElementById('gameFeatureContent').innerHTML=html;
+}
+
+async function queryGameFeature(accId,feature,label){
+  try{
+    await API.get(`/api/game/${feature}/${accId}`);
+    toast(`${label} 查询中...`,'info');
+    // 轮询结果
+    pollGameResult(accId,feature,label);
+  }catch(e){toast(e.message,'error')}
+}
+
+async function pollGameResult(accId,feature,label,maxTries=30){
+  for(let i=0;i<maxTries;i++){
+    await new Promise(r=>setTimeout(r,600));
+    try{
+      const res=await API.get(`/api/game/result/${accId}/${feature}`);
+      if(res.ready&&res.data!==undefined){
+        gameResultCache[`${accId}:${feature}`]=res;
+        if(res.error)toast(`${label}: ${res.error}`,'error');
+        else toast(`${label} 查询完成`,'success');
+        refreshGameFeature();
+        return;
+      }
+    }catch(e){/* continue polling */}
+  }
+  toast(`${label} 查询超时`,'warning');
+}
+
+function renderResultPanel(label,feature,result){
+  let body='';
+  if(result.error){
+    body=`<div style="color:#ef5350;padding:8px">错误: ${esc(result.error)}</div>`;
+  }else{
+    const d=result.data;
+    // 通用JSON展示
+    let jsonDisplay='';
+    const displayKeys=Object.keys(d).filter(k=>k!=='_raw').slice(0,20);
+    for(const k of displayKeys){
+      const v=d[k];
+      let valStr='';
+      if(v===null||v===undefined)valStr='<span style="color:#6a7d8e">-</span>';
+      else if(Array.isArray(v))valStr=`<span style="color:#ffd700">[${v.length}项]</span>`;
+      else if(typeof v==='object')valStr='<span style="color:#8ab4f8">{...}</span>';
+      else if(typeof v==='boolean')valStr=v?'<span style="color:#4caf50">是</span>':'<span style="color:#ef5350">否</span>';
+      else valStr=esc(String(v));
+      jsonDisplay+=`<div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid #171f2e;font-size:12px"><span style="color:#6a7d8e">${esc(k)}</span><span>${valStr}</span></div>`;
+    }
+
+    body=`<div style="font-size:12px;max-height:300px;overflow-y:auto;padding:4px">${jsonDisplay}</div>
+    <div style="margin-top:8px">
+      <a href="#" onclick="showFullJSON('${feature}',event)" style="color:#4fc3f7;font-size:11px">📋 查看完整JSON</a>
+    </div>`;
+  }
+
+  return `<div class="panel" style="margin-top:8px">
+    <div class="panel-title">${label} <span style="color:#4a5a6a;font-size:10px">${new Date(result.time).toLocaleTimeString()}</span>
+      <button class="btn btn-sm btn-red" style="padding:2px 6px;font-size:10px" onclick="clearGameCache('${feature}')">✕</button>
+    </div>
+    ${body}
+  </div>`;
+}
+
+function clearGameCache(feature){
+  const key=`${selectedGameAcc}:${feature}`;
+  delete gameResultCache[key];
+  API.del(`/api/game/result/${selectedGameAcc}/${feature}`).catch(()=>{});
+  refreshGameFeature();
+}
+
+function showFullJSON(feature,ev){
+  ev.preventDefault();
+  const key=`${selectedGameAcc}:${feature}`;
+  const cached=gameResultCache[key];
+  if(!cached||!cached.data)return;
+
+  const mask=document.createElement('div');
+  mask.className='modal-mask';
+  mask.innerHTML=`<div class="modal-box" style="max-width:700px">
+    <div class="modal-title">完整数据: ${feature}<button class="modal-close">&times;</button></div>
+    <pre style="background:#0b1119;padding:12px;border-radius:6px;max-height:60vh;overflow:auto;font-size:11px;color:#c8d6e5;white-space:pre-wrap">${esc(JSON.stringify(cached.data,null,2))}</pre>
+  </div>`;
+  document.body.appendChild(mask);
+  mask.querySelector('.modal-close').onclick=()=>mask.remove();
+  mask.addEventListener('click',e=>{if(e.target===mask)mask.remove()});
+}
+
+// ==================== LOGS + SSE ====================
+const logFeed=document.getElementById('logFeed');
+function appendLogs(logs){
+  const frag=document.createDocumentFragment();
+  for(const l of logs){
+    const cls=l.level==='error'?'err':l.level==='success'?'ok':l.level==='warning'?'warn':'';
+    const div=document.createElement('div');
+    div.className='log-line '+cls;
+    div.innerHTML=`<span class="time">${new Date(l.time).toLocaleTimeString()}</span>${esc(l.message)}`;
+    frag.appendChild(div);
+  }
+  logFeed.appendChild(frag);
+  logFeed.scrollTop=logFeed.scrollHeight;
+  // cap
+  while(logFeed.children.length>200)logFeed.firstChild.remove();
+}
+
+async function loadLogs(){
+  try{const logs=await API.get('/api/control/logs?limit=50');logFeed.innerHTML='';appendLogs(logs.reverse())}catch(e){}
+}
+
+function toggleSSE(){
+  if(sseActive){stopSSE()}else{startSSE()}
+}
+function startSSE(){
+  sseActive=true;
+  document.getElementById('sseLabel').textContent='ON';
+  logFeed.innerHTML='';
+  sseSource=new EventSource('/api/control/logs/stream');
+  sseSource.onmessage=e=>{
+    try{const logs=JSON.parse(e.data);if(!logs.init)appendLogs(logs)}catch{}
+  };
+  sseSource.onerror=()=>{if(sseActive){sseSource.close();setTimeout(startSSE,3000)}};
+}
+function stopSSE(){
+  sseActive=false;
+  document.getElementById('sseLabel').textContent='OFF';
+  if(sseSource){sseSource.close();sseSource=null}
+}
+function clearLogs(){logFeed.innerHTML=''}
+
+// ==================== TAB SWITCH ====================
+document.querySelectorAll('.tab-bar .tab-btn').forEach(b=>b.addEventListener('click',()=>{
+  // 主TAB切换
+  const tab=b.dataset.tab;
+  if(tab){
+    document.querySelectorAll('.tab-bar > .tab-btn').forEach(x=>x.classList.remove('active'));
+    b.classList.add('active');
+    document.querySelectorAll('.tab-content[id^="tab-"]').forEach(c=>c.style.display='none');
+    const panel=document.getElementById('tab-'+tab);
+    if(panel)panel.style.display='block';
+    if(tab==='accounts'||tab==='dash'||tab==='batch'||tab==='game')loadAll();
+    if(tab==='logs'){if(!sseActive)loadLogs();else{logFeed.innerHTML='';startSSE()}}
+    if(tab==='tasks')renderTaskAccSelect();
+    if(tab==='schedules')renderSchList();
+    if(tab==='game'){renderGameAccSelect();refreshGameFeature()}
+  }
+  // 游戏功能子TAB
+  const gtab=b.dataset.gtab;
+  if(gtab){
+    document.querySelectorAll('#gameSubTabBar .tab-btn').forEach(x=>x.classList.remove('active'));
+    b.classList.add('active');
+    activeGameTab=gtab;
+    refreshGameFeature();
+  }
+}));
+
+// ==================== POLLING ====================
+let pollTimer=null;
+function startPoll(){pollTimer=setInterval(loadAll,8000)}
+function stopPoll(){clearInterval(pollTimer)}
+function visiblePoll(){document.hidden?stopPoll():startPoll()}
+document.addEventListener('visibilitychange',visiblePoll);
+
+// init
+loadAll();
+startPoll();
+startSSE();
+
+// cleanup
+window.addEventListener('beforeunload',()=>{stopPoll();stopSSE()});
+</script>
+</body>
+</html>

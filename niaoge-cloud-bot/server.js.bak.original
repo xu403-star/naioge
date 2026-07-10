@@ -1,0 +1,891 @@
+/**
+ * 鸟哥之王云端挂机 - 主服务入口
+ */
+// 全局错误处理，防止未捕获异常导致进程崩溃
+process.on("uncaughtException", (err) => {
+  console.error("[FATAL] 未捕获异常:", err.message);
+  console.error(err.stack);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("[FATAL] 未处理的Promise拒绝:", reason);
+});
+
+import express from "express";
+import cors from "cors";
+import { readFileSync } from "fs";
+import { join, dirname } from "path";
+import { fileURLToPath } from "url";
+import fileUpload from "express-fileupload";
+
+import * as db from "./lib/db.js";
+import { ConnectionPool } from "./lib/connectionPool.js";
+import { TaskRunner } from "./lib/taskRunner.js";
+import { Scheduler } from "./lib/scheduler.js";
+import accountsRouter, { setPool as setAccountsPool } from "./api/accounts.js";
+import tasksRouter, { setScheduler as setTasksScheduler } from "./api/tasks.js";
+import portalRouter from "./api/portal.js";
+import * as portalDb from "./lib/portalDb.js";
+import { authMiddleware, login, logout, getSession, createUser, listUsers, deleteUser, verifyToken } from "./lib/auth.js";
+
+// 批量模块
+import { ClubTasks } from "./lib/batch/tasksClub.js";
+import { DungeonTasks } from "./lib/batch/tasksDungeon.js";
+import { TowerTasks } from "./lib/batch/tasksTower.js";
+import { ItemTasks } from "./lib/batch/tasksItem.js";
+import { CarTasks } from "./lib/batch/tasksCar.js";
+import { LegacyTasks } from "./lib/batch/tasksLegacy.js";
+import { MonthlyTasks } from "./lib/batch/tasksMonthly.js";
+import { StoreTasks } from "./lib/batch/tasksStore.js";
+import { HangupTasks } from "./lib/batch/tasksHangup.js";
+import { BottleTasks } from "./lib/batch/tasksBottle.js";
+import { ArenaTasks } from "./lib/batch/tasksArena.js";
+
+// 游戏功能查询模块
+import { GameStatus } from "./lib/game/gameStatus.js";
+import { ClubInfo } from "./lib/game/clubInfo.js";
+import { Rankings } from "./lib/game/rankings.js";
+import { Activity } from "./lib/game/activity.js";
+import { SaltField } from "./lib/game/saltField.js";
+import { Pvp } from "./lib/game/pvp.js";
+import { GameTools } from "./lib/game/tools.js";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const PORT = process.env.PORT || 3456;
+
+// ======== 初始化核心组件 ========
+const pool = new ConnectionPool();
+setAccountsPool(pool);
+const taskRunner = new TaskRunner(pool);
+const scheduler = new Scheduler(pool, taskRunner);
+setTasksScheduler(scheduler);
+
+// 批量模块实例
+const batchModules = {
+  club: new ClubTasks(pool),
+  dungeon: new DungeonTasks(pool),
+  tower: new TowerTasks(pool),
+  item: new ItemTasks(pool),
+  car: new CarTasks(pool),
+  legacy: new LegacyTasks(pool),
+  monthly: new MonthlyTasks(pool),
+  store: new StoreTasks(pool),
+  hangup: new HangupTasks(pool),
+  bottle: new BottleTasks(pool),
+  arena: new ArenaTasks(pool),
+};
+
+
+// 游戏功能查询模块实例
+const gameModules = {
+  status: new GameStatus(pool),
+  club: new ClubInfo(pool),
+  rankings: new Rankings(pool),
+  activity: new Activity(pool),
+  saltField: new SaltField(pool),
+  pvp: new Pvp(pool),
+  tools: new GameTools(pool),
+};
+
+// 日志回调
+const logBuffer = []; // 保留最近200条日志
+const MAX_LOG = 200;
+
+function addLog(entry) {
+  logBuffer.push(entry);
+  if (logBuffer.length > MAX_LOG) logBuffer.shift();
+  console.log(`[${entry.level?.toUpperCase() || "INFO"}] ${entry.message}`);
+}
+
+pool.setLogCallback(addLog);
+scheduler.setLogCallback(addLog);
+
+// ======== Express 初始化 ========
+const app = express();
+
+app.use(cors());
+app.use(express.json({ limit: "50mb" }));
+app.use(authMiddleware);
+app.use(express.urlencoded({ extended: true, limit: "50mb" }));
+app.use(fileUpload({
+  createParentPath: true,
+  limits: { fileSize: 50 * 1024 * 1024 },
+}));
+
+// ======== 认证 API ========
+app.post("/api/auth/login", async (req, res) => {
+  try {
+    const { userKey, password } = req.body;
+    if (!userKey || !password) return res.status(400).json({ error: "请输入用户名和密码" });
+    const result = login(userKey, password);
+    res.json(result);
+  } catch (e) {
+    res.status(401).json({ error: e.message });
+  }
+});
+
+app.post("/api/auth/logout", (req, res) => {
+  const token = req.headers.authorization?.slice(7);
+  logout(token);
+  res.json({ ok: true });
+});
+
+app.get("/api/auth/me", (req, res) => {
+  const token = req.headers.authorization?.slice(7);
+  const session = getSession(token);
+  if (!session) return res.status(401).json({ error: "未登录" });
+  res.json({ userKey: session.userKey, name: session.name, maxAccounts: session.maxAccounts });
+});
+
+// 修改自己的密码
+app.put("/api/auth/password", (req, res) => {
+  try {
+    const { oldPassword, newPassword } = req.body;
+    if (!oldPassword || !newPassword) return res.status(400).json({ error: "请输入旧密码和新密码" });
+    const user = db.queryOne("SELECT * FROM users WHERE user_key = ? AND password = ?", [req.userKey, oldPassword]);
+    if (!user) return res.status(400).json({ error: "旧密码错误" });
+    if (newPassword.length < 6) return res.status(400).json({ error: "新密码至少6位" });
+    db.exec("UPDATE users SET password = ? WHERE user_key = ?", [newPassword, req.userKey]);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+// 管理员：修改用户信息（含 user_key 和密码）
+app.put("/api/auth/users/:userKey", (req, res) => {
+  try {
+    const token = req.headers.authorization?.slice(7);
+    const admin = verifyToken(token);
+    if (!admin || admin.userKey !== 'admin') return res.status(403).json({ error: "无权限" });
+    const { newUserKey, password, name, maxAccounts, expiry, enabled } = req.body;
+    const oldKey = req.params.userKey;
+    const user = db.queryOne("SELECT * FROM users WHERE user_key = ?", [oldKey]);
+    if (!user) return res.status(404).json({ error: "用户不存在" });
+
+    // 如果改了 user_key，检查新 key 是否冲突
+    if (newUserKey && newUserKey !== oldKey) {
+      const exists = db.queryOne("SELECT * FROM users WHERE user_key = ?", [newUserKey]);
+      if (exists) return res.status(400).json({ error: "新用户名已存在" });
+    }
+
+    // 更新 users 表
+    const updates = [];
+    const params = [];
+    if (newUserKey && newUserKey !== oldKey) { updates.push("user_key = ?"); params.push(newUserKey); }
+    if (password) { updates.push("password = ?"); params.push(password); }
+    if (name !== undefined) { updates.push("name = ?"); params.push(name); }
+    if (maxAccounts !== undefined) { updates.push("max_accounts = ?"); params.push(maxAccounts); }
+    if (expiry !== undefined) { updates.push("expiry = ?"); params.push(expiry || null); }
+    if (enabled !== undefined) { updates.push("enabled = ?"); params.push(enabled ? 1 : 0); }
+    if (updates.length) {
+      params.push(oldKey);
+      db.exec(`UPDATE users SET ${updates.join(', ')} WHERE user_key = ?`, params);
+    }
+
+    // 如果改了 user_key，同步更新所有关联表
+    if (newUserKey && newUserKey !== oldKey) {
+      db.exec("UPDATE accounts SET user_key = ? WHERE user_key = ?", [newUserKey, oldKey]);
+      db.exec("UPDATE task_schedules SET user_key = ? WHERE user_key = ?", [newUserKey, oldKey]);
+      db.exec("UPDATE task_logs SET user_key = ? WHERE user_key = ?", [newUserKey, oldKey]);
+      db.exec("UPDATE task_templates SET user_key = ? WHERE user_key = ?", [newUserKey, oldKey]);
+      db.exec("UPDATE sessions SET user_key = ? WHERE user_key = ?", [newUserKey, oldKey]);
+      // 更新当前 session
+      if (admin.userKey === oldKey) {
+        db.exec("UPDATE sessions SET user_key = ?, name = ? WHERE token = ?", [newUserKey, name || admin.name, token]);
+      }
+    }
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+// 管理员：用户管理
+app.get("/api/auth/users", (req, res) => {
+  try {
+    const token = req.headers.authorization?.slice(7);
+    res.json(listUsers(token));
+  } catch (e) {
+    res.status(403).json({ error: e.message });
+  }
+});
+
+app.post("/api/auth/users", (req, res) => {
+  try {
+    const token = req.headers.authorization?.slice(7);
+    const result = createUser(token, req.body);
+    res.json(result);
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.delete("/api/auth/users/:userKey", (req, res) => {
+  try {
+    const token = req.headers.authorization?.slice(7);
+    deleteUser(token, req.params.userKey);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+// 任务模板 API
+app.get("/api/templates", (req, res) => {
+  res.json(db.getAllTemplates(req.userKey));
+});
+
+app.post("/api/templates", (req, res) => {
+  const { id, name, settings } = req.body;
+  db.addTemplate(id || Date.now().toString(), req.userKey, name, JSON.stringify(settings));
+  res.json({ ok: true });
+});
+
+app.delete("/api/templates/:id", (req, res) => {
+  db.deleteTemplate(req.params.id, req.userKey);
+  res.json({ ok: true });
+});
+
+// ======== API 路由 ========
+app.use("/api/accounts", accountsRouter);
+app.use("/api/tasks", tasksRouter);
+app.use("/v1/portal", portalRouter);
+
+// ======== 控制 API ========
+
+/** 连接账号 */
+app.post("/api/control/connect/:id", async (req, res) => {
+  try {
+    const account = db.getAccount(req.params.id, req.userKey);
+    if (!account) return res.status(404).json({ error: "账号不存在" });
+
+    await pool.ensureConnected(req.params.id);
+    res.json({ success: true });
+  } catch (error) {
+    console.error(`[connect/${req.params.id}] 错误:`, error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/** 断开账号 */
+app.post("/api/control/disconnect/:id", (req, res) => {
+  pool.disconnect(req.params.id);
+  res.json({ success: true });
+});
+
+/** 获取所有连接状态 */
+app.get("/api/control/status", (req, res) => {
+  const accounts = db.getAllAccounts(req.userKey);
+  const statuses = pool.getAllStatus();
+  const result = accounts.map(a => ({
+    id: a.id,
+    name: a.name,
+    enabled: a.enabled,
+    connected: statuses[a.id] === "connected",
+    status: statuses[a.id] || "disconnected",
+    role_id: a.role_id,
+    role_name: a.role_name,
+    level: a.level,
+    last_login: a.last_login,
+  }));
+  res.json(result);
+});
+
+/** 手动执行某个账号的每日任务 */
+app.post("/api/control/run-daily/:id", async (req, res) => {
+  try {
+    const account = db.getAccount(req.params.id, req.userKey);
+    if (!account) return res.status(404).json({ error: "账号不存在" });
+
+    res.json({ success: true, message: "任务已开始执行" });
+
+    // 异步执行，支持前端传递任务设置
+    const customSettings = req.body?.settings || null;
+    try {
+      await taskRunner.run(req.params.id, {
+        onLog: (entry) => {
+          addLog({ ...entry, accountId: req.params.id });
+          db.addLog(req.params.id, account.name, "手动每日任务", entry.message, entry.type || "info", req.userKey);
+        },
+      }, customSettings);
+      addLog({ message: `[${account.name}] 手动每日任务完成`, level: "success" });
+    } catch (error) {
+      addLog({ message: `[${account.name}] 手动每日任务失败: ${error.message}`, level: "error" });
+    }
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/** 重新加载定时任务 */
+app.post("/api/control/reload-schedules", (req, res) => {
+  scheduler.reload();
+  res.json({ success: true });
+});
+
+/** 获取服务器日志 */
+app.get("/api/control/logs", (req, res) => {
+  const limit = parseInt(req.query.limit) || 100;
+  res.json(logBuffer.slice(-limit));
+});
+
+/** 获取定时任务状态 */
+app.get("/api/control/schedules", (req, res) => {
+  res.json(scheduler.getActiveSchedules());
+});
+
+// ======== 仪表盘 ========
+
+/** 仪表盘总览 */
+app.get("/api/control/dashboard", (req, res) => {
+  const accounts = db.getAllAccounts(req.userKey);
+  const statuses = pool.getAllStatus();
+  const connected = accounts.filter(a => statuses[a.id] === "connected");
+  const schedules = db.getEnabledSchedules(req.userKey);
+  const recentLogs = db.getRecentLogs(20, req.userKey);
+
+  res.json({
+    total: accounts.length,
+    connected: connected.length,
+    disabled: accounts.filter(a => !a.enabled).length,
+    schedules: schedules.length,
+    accounts: accounts.map(a => ({
+      id: a.id, name: a.name, level: a.level || 0,
+      role_name: a.role_name || "",
+      enabled: a.enabled,
+      status: statuses[a.id] || "disconnected",
+      connected: statuses[a.id] === "connected",
+      last_login: a.last_login,
+    })),
+    recentLogs,
+  });
+});
+
+// ======== 账号任务设置 ========
+
+/** 获取某个账号的任务设置 */
+app.get("/api/accounts/:id/settings", (req, res) => {
+  const account = db.getAccount(req.params.id, req.userKey);
+  if (!account) return res.status(404).json({ error: "账号不存在" });
+
+  const defaults = {
+    // 阵容配置
+    arenaFormation: 1, bossFormation: 1,
+    // 基础活跃度任务开关
+    shareEnable: true, giveGoldEnable: true,
+    payRecruit: true, freeGoldEnable: true,
+    claimBottle: true, openBox: true,
+    fishingEnable: true, freeGachaEnable: true,
+    // 奖励领取
+    claimHangUp: true, fixedRewardsEnable: true,
+    claimEmail: true,
+    // 功能类任务
+    arenaEnable: true, bossTimes: 2,
+    genieSweepEnable: true, blackMarketPurchase: true,
+    dungeonEnable: true, studyEnable: true,
+    // 通用延迟
+    commandDelay: 500, taskDelay: 500,
+  };
+
+  let settings;
+  try { settings = JSON.parse(account.settings || "{}"); } catch { settings = {}; }
+  res.json({ ...defaults, ...settings });
+});
+
+/** 保存某个账号的任务设置 */
+app.put("/api/accounts/:id/settings", (req, res) => {
+  const account = db.getAccount(req.params.id, req.userKey);
+  if (!account) return res.status(404).json({ error: "账号不存在" });
+  try {
+    db.updateAccount(req.params.id, { settings: JSON.stringify(req.body) }, req.userKey);
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ======== 批量操作 ========
+
+/** 一键连接所有启用的账号 */
+app.post("/api/control/connect-all", async (req, res) => {
+  res.json({ success: true, message: "开始连接所有账号" });
+
+  const accounts = db.getAllAccounts(req.userKey).filter(a => a.enabled);
+  addLog({ message: `开始连接 ${accounts.length} 个账号...`, level: "info" });
+
+  for (const account of accounts) {
+    const status = pool.getStatus(account.id);
+    if (status === "connected") continue;
+    pool.connect(account.id, account.token, account.ws_url).catch(err => {
+      addLog({ message: `[${account.name}] 连接失败: ${err.message}`, level: "error" });
+    });
+    await new Promise(r => setTimeout(r, 2000)); // 错开连接
+  }
+});
+
+/** 一键断开所有账号 */
+app.post("/api/control/disconnect-all", (req, res) => {
+  pool.disconnectAll();
+  addLog({ message: "所有账号已断开", level: "info" });
+  res.json({ success: true });
+});
+
+/** 一键执行指定账号列表的每日任务 */
+app.post("/api/control/run-daily-batch", async (req, res) => {
+  const { accountIds, settings } = req.body || {};
+  if (!accountIds || !Array.isArray(accountIds) || !accountIds.length) {
+    return res.status(400).json({ error: "请提供账号ID列表" });
+  }
+
+  const accounts = db.getAllAccounts(req.userKey).filter(a => accountIds.includes(a.id));
+  if (!accounts.length) return res.status(400).json({ error: "没有找到匹配的账号" });
+
+  res.json({ success: true, message: `开始执行 ${accounts.length} 个账号的每日任务` });
+  addLog({ message: `批量每日任务(选中): ${accounts.length} 个账号`, level: "info" });
+
+  for (const account of accounts) {
+    try {
+      await taskRunner.run(account.id, {
+        onLog: (entry) => {
+          addLog({ ...entry, accountId: account.id });
+          db.addLog(account.id, account.name, "批量每日任务", entry.message, entry.type || "info", req.userKey);
+        },
+      }, settings || null);
+      addLog({ message: `[${account.name}] 每日任务完成`, level: "success" });
+    } catch (error) {
+      addLog({ message: `[${account.name}] 每日任务失败: ${error.message}`, level: "error" });
+      db.addLog(account.id, account.name, "批量每日任务", "error", error.message, req.userKey);
+    }
+    await new Promise(r => setTimeout(r, 3000));
+  }
+});
+
+/** 一键执行所有已连接账号的每日任务 */
+app.post("/api/control/run-daily-all", async (req, res) => {
+  const accounts = db.getAllAccounts(req.userKey);
+  const statuses = pool.getAllStatus();
+  const connected = accounts.filter(a => statuses[a.id] === "connected");
+
+  if (!connected.length) {
+    return res.status(400).json({ error: "没有已连接的账号" });
+  }
+
+  const customSettings = req.body?.settings || null;
+  res.json({ success: true, message: `开始执行 ${connected.length} 个账号的每日任务` });
+
+  addLog({ message: `批量每日任务: ${connected.length} 个账号`, level: "info" });
+
+  for (const account of connected) {
+    try {
+      await taskRunner.run(account.id, {
+        onLog: (entry) => {
+          addLog({ ...entry, accountId: account.id });
+          db.addLog(account.id, account.name, "批量每日任务", entry.message, entry.type || "info", req.userKey);
+        },
+      }, customSettings);
+      addLog({ message: `[${account.name}] 每日任务完成`, level: "success" });
+    } catch (error) {
+      addLog({ message: `[${account.name}] 每日任务失败: ${error.message}`, level: "error" });
+      db.addLog(account.id, account.name, "批量每日任务", "error", error.message, req.userKey);
+    }
+    await new Promise(r => setTimeout(r, 3000));
+  }
+});
+
+// ======== 批量功能 API ========
+
+/** 获取所有可用的批量操作列表 */
+app.get("/api/batch/operations", (req, res) => {
+  res.json([
+    // 副本
+    { key: "dungeonBaoku13", category: "副本", label: "宝库前3层" },
+    { key: "dungeonBaoku45", category: "副本", label: "宝库4-5层" },
+    { key: "dungeonMengjing", category: "副本", label: "咸王梦境" },
+    { key: "dungeonBuyDreamItems", category: "副本", label: "梦境商品购买" },
+    // 怪异塔
+    { key: "towerClimb", category: "怪异塔", label: "一键爬塔" },
+    { key: "towerClimbWeird", category: "怪异塔", label: "一键爬怪异塔" },
+    { key: "towerClaimFreeEnergy", category: "怪异塔", label: "领取免费道具" },
+    // 资源
+    { key: "carSmartSend", category: "资源", label: "智能发车" },
+    { key: "carClaimAll", category: "资源", label: "一键收车" },
+    { key: "itemOpenBox", category: "资源", label: "批量开箱" },
+    { key: "itemClaimBoxPoint", category: "资源", label: "宝箱积分" },
+    { key: "itemFish", category: "资源", label: "批量钓鱼" },
+    { key: "itemRecruit", category: "资源", label: "批量招募" },
+    { key: "itemGenieSweep", category: "资源", label: "灯神扫荡" },
+    { key: "itemClaimPeach", category: "资源", label: "蟠桃园任务" },
+    // 功法
+    { key: "legacyClaim", category: "功法", label: "领取功法残卷" },
+    { key: "legacyGiftSend", category: "功法", label: "赠送功法残卷" },
+    // 月度
+    { key: "monthlyTopUpFish", category: "月度", label: "钓鱼补齐" },
+    { key: "monthlyTopUpArena", category: "月度", label: "竞技场补齐" },
+    // 俱乐部
+    { key: "clubSignin", category: "俱乐部", label: "俱乐部签到" },
+    { key: "clubResearch", category: "俱乐部", label: "俱乐部研究" },
+    { key: "clubApproveAll", category: "俱乐部", label: "审批申请" },
+    { key: "clubSignupMatch", category: "俱乐部", label: "排位报名" },
+    { key: "clubWarGuess", category: "俱乐部", label: "月赛助威" },
+    // 商店
+    { key: "storeFourGuardians", category: "商店", label: "四圣碎片" },
+    { key: "storeSkinCoins", category: "商店", label: "皮肤币x5" },
+    { key: "storeQuickPurchase", category: "商店", label: "黑市采购" },
+    { key: "storeCollectionFree", category: "商店", label: "珍宝阁领取" },
+    // 其它
+    { key: "itemHeroUpgrade", category: "资源", label: "英雄升星" },
+    { key: "itemBookUpgrade", category: "资源", label: "图鉴升星" },
+    { key: "itemClaimBookReward", category: "资源", label: "图鉴奖励" },
+  ]);
+});
+
+// ======== 游戏功能查询 API ========
+
+/** 工具函数：确保账号已连接，否则返回错误 */
+async function requireConnected(id, userKey) {
+  const account = db.getAccount(id, userKey);
+  if (!account) throw Object.assign(new Error("账号不存在"), { status: 404 });
+  const status = pool.getStatus(id);
+  if (status !== "connected") {
+    // 尝试自动连接
+    try { await pool.ensureConnected(id); }
+    catch (e) { throw Object.assign(new Error("账号未连接"), { status: 400 }); }
+  }
+  return account;
+}
+
+/** 包装异步查询：立即返回，异步更新日志 */
+function wrapGameQuery(getId, getName, feature, queryFn) {
+  return async (req, res) => {
+    const id = getId(req);
+    const accountName = getName instanceof Function ? getName(req) : (getName || id);
+    try {
+      await requireConnected(id, req.userKey);
+      res.json({ success: true, message: `${feature} 查询已开始，请查看结果` });
+      try {
+        const data = await queryFn(req);
+        addLog({ message: `[${accountName}] ${feature} 查询完成`, level: "success" });
+        // 结果存入内存供前端轮询
+        queryResults.set(`${id}:${feature}`, { time: Date.now(), data });
+      } catch (e) {
+        addLog({ message: `[${accountName}] ${feature} 查询失败: ${e.message}`, level: "error" });
+        queryResults.set(`${id}:${feature}`, { time: Date.now(), error: e.message });
+      }
+    } catch (e) {
+      res.status(e.status || 500).json({ error: e.message });
+    }
+  };
+}
+
+/** 查询结果缓存 */
+const queryResults = new Map();
+
+/** 获取某个查询结果 */
+app.get("/api/game/result/:id/:feature", (req, res) => {
+  const key = `${req.params.id}:${req.params.feature}`;
+  const result = queryResults.get(key);
+  if (!result) return res.json({ ready: false });
+  res.json({ ready: true, ...result });
+});
+
+/** 清除查询结果 */
+app.delete("/api/game/result/:id/:feature", (req, res) => {
+  queryResults.delete(`${req.params.id}:${req.params.feature}`);
+  res.json({ success: true });
+});
+
+// ======== 日常状态 ========
+
+/** 获取角色完整状态 */
+app.get("/api/game/daily-status/:id", wrapGameQuery(
+  (req) => req.params.id, (req) => db.getAccount(req.params.id, req.userKey)?.name || req.params.id, "日常状态",
+  (req) => gameModules.status.getAllStatus(req.params.id)
+));
+
+/** 获取角色信息 */
+app.get("/api/game/role-info/:id", wrapGameQuery(
+  (req) => req.params.id, (req) => db.getAccount(req.params.id, req.userKey)?.name || req.params.id, "角色信息",
+  (req) => gameModules.status.getRoleInfo(req.params.id)
+));
+
+/** 获取阵容 */
+app.get("/api/game/formations/:id", wrapGameQuery(
+  (req) => req.params.id, (req) => db.getAccount(req.params.id, req.userKey)?.name || req.params.id, "阵容",
+  (req) => gameModules.status.getFormations(req.params.id)
+));
+
+/** 获取咸将塔 */
+app.get("/api/game/tower/:id", wrapGameQuery(
+  (req) => req.params.id, (req) => db.getAccount(req.params.id, req.userKey)?.name || req.params.id, "咸将塔",
+  (req) => gameModules.status.getTowerInfo(req.params.id)
+));
+
+/** 获取怪异塔 */
+app.get("/api/game/weird-tower/:id", wrapGameQuery(
+  (req) => req.params.id, (req) => db.getAccount(req.params.id, req.userKey)?.name || req.params.id, "怪异塔",
+  (req) => gameModules.status.getWeirdTowerInfo(req.params.id)
+));
+
+// ======== 俱乐部 ========
+
+/** 获取俱乐部信息 */
+app.get("/api/game/club/:id", wrapGameQuery(
+  (req) => req.params.id, (req) => db.getAccount(req.params.id, req.userKey)?.name || req.params.id, "俱乐部信息",
+  (req) => gameModules.club.getClubInfo(req.params.id)
+));
+
+/** 获取俱乐部成员 */
+app.get("/api/game/club-members/:id", wrapGameQuery(
+  (req) => req.params.id, (req) => db.getAccount(req.params.id, req.userKey)?.name || req.params.id, "成员列表",
+  (req) => gameModules.club.getMembers(req.params.id)
+));
+
+/** 获取入会申请 */
+app.get("/api/game/club-apply/:id", wrapGameQuery(
+  (req) => req.params.id, (req) => db.getAccount(req.params.id, req.userKey)?.name || req.params.id, "入会申请",
+  (req) => gameModules.club.getApplyList(req.params.id)
+));
+
+/** 获取盐场匹配排名 */
+app.get("/api/game/war-rank/:id", wrapGameQuery(
+  (req) => req.params.id, (req) => db.getAccount(req.params.id, req.userKey)?.name || req.params.id, "盐场排名",
+  (req) => gameModules.club.getWarRank(req.params.id)
+));
+
+// ======== 盐场 ========
+
+/** 获取盐场信息 */
+app.get("/api/game/salt-field/:id", wrapGameQuery(
+  (req) => req.params.id, (req) => db.getAccount(req.params.id, req.userKey)?.name || req.params.id, "盐场信息",
+  (req) => gameModules.saltField.getWarType(req.params.id)
+));
+
+/** 获取盐场分组排名 */
+app.get("/api/game/salt-group-rank/:id", wrapGameQuery(
+  (req) => req.params.id, (req) => db.getAccount(req.params.id, req.userKey)?.name || req.params.id, "盐场分组",
+  (req) => gameModules.saltField.getGroupRank(req.params.id)
+));
+
+/** 获取盐场战场 */
+app.get("/api/game/battlefield/:id", wrapGameQuery(
+  (req) => req.params.id, (req) => db.getAccount(req.params.id, req.userKey)?.name || req.params.id, "盐场战场",
+  (req) => gameModules.saltField.getBattlefield(req.params.id)
+));
+
+/** 获取本周战绩 */
+app.get("/api/game/week-battle/:id", wrapGameQuery(
+  (req) => req.params.id, (req) => db.getAccount(req.params.id, req.userKey)?.name || req.params.id, "本周战绩",
+  (req) => gameModules.club.getWeekBattleRecords(req.params.id)
+));
+
+/** 获取本月战绩 */
+app.get("/api/game/month-battle/:id", wrapGameQuery(
+  (req) => req.params.id, (req) => db.getAccount(req.params.id, req.userKey)?.name || req.params.id, "本月战绩",
+  (req) => gameModules.club.getMonthBattleRecords(req.params.id)
+));
+
+// ======== 蟠桃园 ========
+
+/** 获取蟠桃园信息 */
+app.get("/api/game/peach/:id", wrapGameQuery(
+  (req) => req.params.id, (req) => db.getAccount(req.params.id, req.userKey)?.name || req.params.id, "蟠桃园",
+  (req) => gameModules.club.getPeachInfo(req.params.id)
+));
+
+/** 获取蟠桃园战绩 */
+app.get("/api/game/peach-battle/:id", wrapGameQuery(
+  (req) => req.params.id, (req) => db.getAccount(req.params.id, req.userKey)?.name || req.params.id, "蟠桃战绩",
+  (req) => gameModules.club.getPeachBattleRecords(req.params.id)
+));
+
+// ======== 排行榜 ========
+
+/** 获取区服榜 */
+app.get("/api/game/rank-server/:id", wrapGameQuery(
+  (req) => req.params.id, (req) => db.getAccount(req.params.id, req.userKey)?.name || req.params.id, "区服榜",
+  (req) => gameModules.rankings.getServerRank(req.params.id)
+));
+
+/** 获取巅峰榜 */
+app.get("/api/game/rank-top/:id", wrapGameQuery(
+  (req) => req.params.id, (req) => db.getAccount(req.params.id, req.userKey)?.name || req.params.id, "巅峰榜",
+  (req) => gameModules.rankings.getTopRank(req.params.id)
+));
+
+/** 获取俱乐部榜 */
+app.get("/api/game/rank-club/:id", wrapGameQuery(
+  (req) => req.params.id, (req) => db.getAccount(req.params.id, req.userKey)?.name || req.params.id, "俱乐部榜",
+  (req) => gameModules.rankings.getTopClubRank(req.params.id)
+));
+
+/** 获取黄金积分榜 */
+app.get("/api/game/rank-gold/:id", wrapGameQuery(
+  (req) => req.params.id, (req) => db.getAccount(req.params.id, req.userKey)?.name || req.params.id, "黄金积分榜",
+  (req) => gameModules.rankings.getGoldClubRank(req.params.id)
+));
+
+/** 获取伟大航路榜 */
+app.get("/api/game/rank-route/:id", wrapGameQuery(
+  (req) => req.params.id, (req) => db.getAccount(req.params.id, req.userKey)?.name || req.params.id, "伟大航路榜",
+  (req) => gameModules.rankings.getGreatRouteRank(req.params.id)
+));
+
+// ======== 活动 ========
+
+/** 获取月度任务 */
+app.get("/api/game/monthly/:id", wrapGameQuery(
+  (req) => req.params.id, (req) => db.getAccount(req.params.id, req.userKey)?.name || req.params.id, "月度任务",
+  (req) => gameModules.activity.getMonthlyTasks(req.params.id)
+));
+
+/** 获取答题状态 */
+app.get("/api/game/study/:id", wrapGameQuery(
+  (req) => req.params.id, (req) => db.getAccount(req.params.id, req.userKey)?.name || req.params.id, "答题状态",
+  (req) => gameModules.activity.getStudyStatus(req.params.id)
+));
+
+/** 获取邮件 */
+app.get("/api/game/mail/:id", wrapGameQuery(
+  (req) => req.params.id, (req) => db.getAccount(req.params.id, req.userKey)?.name || req.params.id, "邮件列表",
+  (req) => gameModules.activity.getMailList(req.params.id)
+));
+
+// ======== 切磋 ========
+
+/** 获取竞技场对手 */
+app.get("/api/game/arena-targets/:id", wrapGameQuery(
+  (req) => req.params.id, (req) => db.getAccount(req.params.id, req.userKey)?.name || req.params.id, "竞技场对手",
+  (req) => gameModules.pvp.getArenaTargets(req.params.id, req.query.refresh === "true")
+));
+
+/** 获取竞技场排名 */
+app.get("/api/game/arena-rank/:id", wrapGameQuery(
+  (req) => req.params.id, (req) => db.getAccount(req.params.id, req.userKey)?.name || req.params.id, "竞技场排名",
+  (req) => gameModules.pvp.getArenaRank(req.params.id)
+));
+
+/** 切磋操作 */
+app.post("/api/game/fight/:id", async (req, res) => {
+  try {
+    const account = await requireConnected(req.params.id, req.userKey);
+    if (!req.body.targetId) return res.status(400).json({ error: "缺少 targetId" });
+    res.json({ success: true, message: "切磋已开始" });
+    try {
+      const result = await gameModules.pvp.startFight(req.params.id, req.body.targetId);
+      addLog({ message: `[${account.name}] 切磋: ${result.success ? "完成" : result.message}`, level: result.success ? "success" : "warning" });
+      queryResults.set(`${req.params.id}:fightResult`, { time: Date.now(), data: result });
+    } catch (e) {
+      addLog({ message: `[${account.name}] 切磋失败: ${e.message}`, level: "error" });
+    }
+  } catch (e) { res.status(e.status || 500).json({ error: e.message }); }
+});
+
+// ======== 工具 ========
+
+/** 获取商店商品 */
+app.get("/api/game/store/:id", wrapGameQuery(
+  (req) => req.params.id, (req) => db.getAccount(req.params.id, req.userKey)?.name || req.params.id, "商店",
+  (req) => gameModules.tools.getStoreGoods(req.params.id, parseInt(req.query.storeId) || 1)
+));
+
+/** 获取挂机奖励预览 */
+app.get("/api/game/hangup-reward/:id", wrapGameQuery(
+  (req) => req.params.id, (req) => db.getAccount(req.params.id, req.userKey)?.name || req.params.id, "挂机奖励",
+  (req) => gameModules.tools.getHangUpReward(req.params.id)
+));
+
+/** 获取梦境信息 */
+app.get("/api/game/dream/:id", wrapGameQuery(
+  (req) => req.params.id, (req) => db.getAccount(req.params.id, req.userKey)?.name || req.params.id, "梦境",
+  (req) => gameModules.tools.getDreamInfo(req.params.id)
+));
+
+// ======== 用户自定义命令 ========
+
+/** 发送任意游戏命令 */
+app.post("/api/game/raw/:id", async (req, res) => {
+  try {
+    const account = await requireConnected(req.params.id, req.userKey);
+    const { cmd, params, timeout } = req.body || {};
+    if (!cmd) return res.status(400).json({ error: "缺少 cmd" });
+    res.json({ success: true, message: `命令 ${cmd} 已发送` });
+    try {
+      const result = await pool.sendMessage(req.params.id, cmd, params || {}, timeout || 8000);
+      addLog({ message: `[${account.name}] 命令 ${cmd} 完成`, level: "success" });
+      queryResults.set(`${req.params.id}:rawCmd`, { time: Date.now(), data: result });
+    } catch (e) {
+      addLog({ message: `[${account.name}] 命令 ${cmd} 失败: ${e.message}`, level: "error" });
+    }
+  } catch (e) { res.status(e.status || 500).json({ error: e.message }); }
+});
+
+/** SSE 实时日志推送 */
+app.get("/api/control/logs/stream", (req, res) => {
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no",
+  });
+
+  res.write("data: {\"init\":true}\n\n");
+
+  // 定期发送日志
+  const interval = setInterval(() => {
+    const recent = logBuffer.slice(-20);
+    if (recent.length > 0) {
+      res.write(`data: ${JSON.stringify(recent)}\n\n`);
+    }
+  }, 2000);
+
+  req.on("close", () => {
+    clearInterval(interval);
+  });
+});
+
+// ======== 静态文件（前端） ========
+// 优先使用 Vue 构建的 dist-vue，回退到 public
+import { existsSync } from "fs";
+const vueDist = join(__dirname, "dist-vue");
+if (existsSync(vueDist)) {
+  app.use(express.static(vueDist));
+  console.log("[server] 使用 Vue 前端: dist-vue/");
+}
+app.use(express.static(join(__dirname, "public")));
+
+// 前端 SPA fallback（优先 Vue）
+app.get("*", (req, res) => {
+  if (!req.path.startsWith("/api")) {
+    const vueIndex = join(__dirname, "dist-vue", "index.html");
+    if (existsSync(vueIndex)) {
+      return res.sendFile(vueIndex);
+    }
+    res.sendFile(join(__dirname, "public", "index.html"));
+  }
+});
+
+// ======== 启动 ========
+async function start() {
+  // 初始化数据库
+  console.log("正在初始化数据库...");
+  await db.initDatabase();
+  console.log("数据库初始化完成");
+
+  // Portal卡密表初始化（依赖db初始化完毕）
+  portalDb.initPortalDB();
+
+  app.listen(PORT, () => {
+    console.log(`\n========================================`);
+    console.log(`  niaoge cloud bot v1.0.0`);
+    console.log(`  http://localhost:${PORT}`);
+    console.log(`========================================\n`);
+
+    // 启动定时任务（任务执行时会按需连接账号，避免启动时并发连接风暴）
+    scheduler.init();
+  });
+}
+
+start().catch(err => {
+  console.error("启动失败:", err);
+  process.exit(1);
+});
