@@ -1042,59 +1042,38 @@ async function runDaily(acc) {
 }
 
 async function waitDailyCompleteAndRefresh(id) {
-  // 任务执行期间只检查日志是否完成，不调用 queryAccountStatus 刷新进度，
-  // 避免任务完成后又因查询而重新建立连接占槽位。
+  // 任务执行期间监听后端推送的活跃度更新和日志完成标志
   for (let i = 0; i < 60; i++) {
     await new Promise(r => setTimeout(r, 3000))
     try {
-      // 每次轮询前刷新账号信息，确保能拿到 taskRunner 写入的最新 role_id
-      await loadAccounts()
-      const acc = accounts.value.find(a => a.id === id)
-      // 优先用 roleId 匹配日志，账号 ID 作为兜底
-      const roleId = acc?.role_id
-      const idTag = roleId ? `[role:${roleId}]` : `[id:${id}]`
-
-      // 从日志中检测该账号的每日任务是否已完成
       const serverLogs = await api.get('/api/control/logs?limit=200')
-      const completed = serverLogs.some(l =>
-        l.message && l.message.includes(idTag) && /手动每日任务完成|所有任务执行完成|每日任务完成/.test(l.message)
+
+      // 1. 解析活跃度实时推送
+      const updateLog = serverLogs.find(l =>
+        l.accountId === id && l.message?.startsWith('__DAILY_POINT_UPDATE__:')
       )
-      if (completed) {
-        // 优先从最终活跃度日志解析实时分数，避免快照读不到最新值
-        const finalLog = serverLogs.find(l =>
-          l.message && l.message.includes(idTag) && /最终活跃度:\s*\d+\/\d+/.test(l.message)
-        )
-        let parsedPoint = null
-        let parsedMax = null
-        if (finalLog) {
-          const match = finalLog.message.match(/最终活跃度:\s*(\d+)\/(\d+)/)
-          if (match) {
-            parsedPoint = parseInt(match[1], 10)
-            parsedMax = parseInt(match[2], 10)
-          }
-        }
-        // 先把解析值写入状态，再读快照兜底；快照若过期/为0不覆盖解析值
-        if (parsedPoint !== null) {
-          const current = accountStatusMap[id] || {}
-          accountStatusMap[id] = {
-            ...current,
-            dailyPoint: parsedPoint,
-            dailyPointMax: parsedMax,
-            snapshot: true
-          }
-        }
-        // 任务完成：只读快照，不再触发连接，并把前端状态改为离线
-        await loadAccountDailySnapshot(id)
-        await loadAccountCarSnapshot(id)
-        // 快照返回过期/0分时，恢复解析出的日志值
-        if (parsedPoint !== null && (!accountStatusMap[id]?.dailyPoint || accountStatusMap[id]?.dailyPoint === 0)) {
+      if (updateLog) {
+        const match = updateLog.message.match(/__(\d+)\/(\d+)/)
+        if (match) {
+          const point = parseInt(match[1], 10)
+          const max = parseInt(match[2], 10)
           accountStatusMap[id] = {
             ...(accountStatusMap[id] || {}),
-            dailyPoint: parsedPoint,
-            dailyPointMax: parsedMax,
-            snapshot: true
+            dailyPoint: point,
+            dailyPointMax: max,
+            pending: true
           }
         }
+      }
+
+      // 2. 检测完成标志
+      const completed = serverLogs.some(l =>
+        l.accountId === id && /手动每日任务完成|所有任务执行完成|每日任务完成/.test(l.message)
+      )
+      if (completed) {
+        await loadAccountDailySnapshot(id)
+        await loadAccountCarSnapshot(id)
+        const acc = accounts.value.find(a => a.id === id)
         if (acc) {
           acc.status = 'disconnected'
           const s = accountStatusMap[id]

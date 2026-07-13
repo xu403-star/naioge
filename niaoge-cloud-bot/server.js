@@ -406,6 +406,10 @@ app.post("/api/control/run-daily/:id", async (req, res) => {
           addLog({ ...entry, accountId: req.params.id });
           db.addLog(req.params.id, account.name, "手动每日任务", entry.message, entry.type || "info", req.userKey);
         },
+        onDailyPointUpdate: (accountId, point, max) => {
+          // 活跃度变化时通过全局日志通道实时通知前端
+          addLog({ accountId, message: `__DAILY_POINT_UPDATE__:${point}/${max}`, type: "info" });
+        },
       }, customSettings);
       addLog({ message: `[role:${account.role_id || account.id}][${account.name}] 手动每日任务完成`, level: "success" });
     } catch (error) {

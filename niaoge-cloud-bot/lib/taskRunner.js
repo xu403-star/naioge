@@ -360,6 +360,14 @@ export class TaskRunner {
     this.currentAccountName = accountName;
     this.currentRoleId = "";
 
+    // 辅助函数：上报活跃度并持久化
+    const reportDailyPoint = (point, max) => {
+      saveDailySnapshot(accountId, point, max);
+      if (callbacks?.onDailyPointUpdate) {
+        try { callbacks.onDailyPointUpdate(accountId, point, max); } catch {}
+      }
+    };
+
     this.log(`开始每日任务`);
 
     // 新任务开始前清除可能残留的手动中止标记，避免上一次的断开操作影响本次任务
@@ -474,6 +482,7 @@ export class TaskRunner {
     }
 
     this.log(`当前活跃度: ${currentDailyPoint}/${dailyPointMax}`);
+    reportDailyPoint(currentDailyPoint, dailyPointMax);
 
     // ====== 第四步：活跃度判断与任务模式选择 ======
     const ACTIVITY_MAX = 110;
@@ -499,6 +508,7 @@ export class TaskRunner {
         }
         dailyTask = verifyDailyTask;
         this.log(`活跃度校验完成: ${currentDailyPoint}/${dailyPointMax}`);
+        reportDailyPoint(currentDailyPoint, dailyPointMax);
       } catch (e) {
         this.log(`活跃度校验失败: ${e.message}`, "warning");
       }
@@ -858,6 +868,7 @@ export class TaskRunner {
             dailyPointMax = freshMax;
           }
           this.log(`刷新后活跃度: ${currentDailyPoint}/${dailyPointMax}`);
+          reportDailyPoint(currentDailyPoint, dailyPointMax);
         } catch (e) {
           this.log(`刷新任务状态失败: ${e.message}`, "warning");
         }
@@ -878,6 +889,7 @@ export class TaskRunner {
               currentDailyPoint = newPoint;
               dailyPointMax = newMax;
               this.log(`领取任务奖励${taskId}后活跃度: ${currentDailyPoint}/${dailyPointMax}`, "success");
+              reportDailyPoint(currentDailyPoint, dailyPointMax);
             }
           }
         }
@@ -1047,8 +1059,8 @@ export class TaskRunner {
       const finalDailyTask = finalResp?.role?.dailyTask ?? {};
       const { point: finalPoint, max: finalMax } = getDailyPointInfo(finalDailyTask);
       this.log(`最终活跃度: ${finalPoint}/${finalMax}`, "success");
-      // 把最终活跃度写入账号 settings，刷新页面也不会丢失
       saveDailySnapshot(accountId, finalPoint, finalMax);
+      reportDailyPoint(finalPoint, finalMax);
     } catch (e) { /* ignore */ }
 
     if (this.callbacks.onProgress) this.callbacks.onProgress(100);
