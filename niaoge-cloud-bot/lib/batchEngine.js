@@ -114,7 +114,10 @@ export class BatchEngine {
         this._emitLog(run, accountId, `[${name}] 开始执行 ${this._getLabel(run.operation)}`, "info");
 
         const logCb = (entry) => {
-          this._emitLog(run, accountId, entry.message, entry.type || "info");
+          const message = entry.message?.startsWith(`[${name}]`)
+            ? entry.message
+            : `[${name}] ${entry.message}`;
+          this._emitLog(run, accountId, message, entry.type || "info");
         };
 
         await executeBatchOperation(this.modules, run.operation, accountId, run.body, logCb, run.userKey);
