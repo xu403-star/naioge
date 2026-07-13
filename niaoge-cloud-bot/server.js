@@ -411,9 +411,9 @@ app.post("/api/control/run-daily/:id", async (req, res) => {
           addLog({ accountId, message: `__DAILY_POINT_UPDATE__:${point}/${max}`, type: "info" });
         },
       }, customSettings);
-      addLog({ message: `[role:${account.role_id || account.id}][${account.name}] 手动每日任务完成`, level: "success" });
+      addLog({ message: `[${account.role_name || account.name}] 手动每日任务完成`, level: "success" });
     } catch (error) {
-      addLog({ message: `[role:${account.role_id || account.id}][${account.name}] 手动每日任务失败: ${error.message}`, level: "error" });
+      addLog({ message: `[${account.role_name || account.name}] 手动每日任务失败: ${error.message}`, level: "error" });
     }
   } catch (error) {
     res.status(500).json({ error: error.message });

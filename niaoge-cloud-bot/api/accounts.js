@@ -175,6 +175,9 @@ router.post("/batch", async (req, res) => {
           console.error(`[BIN批处理] 文件:${binFile.name} 解析角色失败:`, e.message);
         }
 
+        // 分离纯角色名与显示名
+        const pureRoleName = roleName.includes("-") ? roleName.split("-").slice(0, -1).join("-") : roleName;
+
         // 调用 authuser API 获取 JSON Token
         let jsonToken;
         try {
@@ -188,6 +191,7 @@ router.post("/batch", async (req, res) => {
         db.addAccount({
           id: tokenId,
           name: roleName,
+          role_name: pureRoleName,
           token: jsonToken,
           wsUrl,
           binBase64,
@@ -241,6 +245,7 @@ router.post("/bin", async (req, res) => {
 
     // 从 BIN 内容解析真实角色名（避免文件名中文乱码）
     // 注意：parse/getServerList 会原地修改 buffer，所以必须复制一份用于解析
+    let roleName = "";
     if (!autoName) {
       try {
         const parseBuffer = binArrayBuffer.slice(0);
@@ -251,39 +256,40 @@ router.post("/bin", async (req, res) => {
         console.log(`[BIN单文件] 文件:${fileName} 角色数:${roles.length}`, roles.map(r => ({ name: r.name, serverId: r.serverId, id: r.id })));
 
         // 优先用 BIN 文件自己的 serverId 精确匹配角色（parseBinData 已能正确返回编码后的 serverId）
-          let originalServerId = null;
-          try {
-            const binData = parseBinData(parseBuffer);
-            originalServerId = binData?.serverId ?? null;
-          } catch (e) {
-            console.error(`[BIN单文件] 解析原始serverId失败:`, e.message);
-          }
+        let originalServerId = null;
+        try {
+          const binData = parseBinData(parseBuffer);
+          originalServerId = binData?.serverId ?? null;
+        } catch (e) {
+          console.error(`[BIN单文件] 解析原始serverId失败:`, e.message);
+        }
 
-          // 文件名解析：去掉扩展名，提取末尾数字作为角色序号
-          const indexMatch = fileName.match(/(\d+)$/);
-          const fileIndex = indexMatch ? parseInt(indexMatch[1], 10) : null;
-          const fileNameCn = fileName.replace(/\d+$/, "").trim();
+        // 文件名解析：去掉扩展名，提取末尾数字作为角色序号
+        const indexMatch = fileName.match(/(\d+)$/);
+        const fileIndex = indexMatch ? parseInt(indexMatch[1], 10) : null;
+        const fileNameCn = fileName.replace(/\d+$/, "").trim();
 
-          const matched =
-            // 1. 优先：BIN 原始 serverId 精确匹配
-            (originalServerId !== null
-              ? roles.find(r => Number(r.serverId) === Number(originalServerId))
-              : null) ||
-            // 2. 精确匹配角色名 == 文件名
-            roles.find(r => r.name === fileName) ||
-            // 3. 角色名 == 文件名中文 + 角色序号匹配
-            (fileIndex !== null
-              ? roles.find(r => r.name === fileNameCn && getRoleIndex(r.serverId) === fileIndex)
-              : null) ||
-            // 4. 角色名包含文件名中文
-            roles.find(r => r.name && r.name.includes(fileNameCn)) ||
-            roles.find(r => r.name && fileNameCn.includes(r.name)) ||
-            // 5. 兜底第一个角色
-            roles[0];
-          console.log(`[BIN单文件] 文件:${fileName} 原始serverId:${originalServerId} 匹配到:`, matched?.name, matched?.serverId);
+        const matched =
+          // 1. 优先：BIN 原始 serverId 精确匹配
+          (originalServerId !== null
+            ? roles.find(r => Number(r.serverId) === Number(originalServerId))
+            : null) ||
+          // 2. 精确匹配角色名 == 文件名
+          roles.find(r => r.name === fileName) ||
+          // 3. 角色名 == 文件名中文 + 角色序号匹配
+          (fileIndex !== null
+            ? roles.find(r => r.name === fileNameCn && getRoleIndex(r.serverId) === fileIndex)
+            : null) ||
+          // 4. 角色名包含文件名中文
+          roles.find(r => r.name && r.name.includes(fileNameCn)) ||
+          roles.find(r => r.name && fileNameCn.includes(r.name)) ||
+          // 5. 兜底第一个角色
+          roles[0];
+        console.log(`[BIN单文件] 文件:${fileName} 原始serverId:${originalServerId} 匹配到:`, matched?.name, matched?.serverId);
         if (matched?.name) {
           const serverNum = getServerNum(matched.serverId);
           autoName = `${matched.name}-${serverNum}服`;
+          roleName = matched.name;
         }
       } catch (e) {
         console.error(`[BIN单文件] 解析角色失败:`, e.message, e.stack);
@@ -304,6 +310,7 @@ router.post("/bin", async (req, res) => {
     db.addAccount({
       id: tokenId,
       name: autoName,
+      role_name: roleName,
       token: jsonToken,
       wsUrl,
       binBase64: getBinBase64Token(binArrayBuffer),

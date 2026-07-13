@@ -159,7 +159,25 @@ export async function initDatabase() {
       if (!colNames.includes('upgraded_at')) {
         db.run("ALTER TABLE accounts ADD COLUMN upgraded_at TEXT");
       }
+      if (!colNames.includes('role_name')) {
+        db.run("ALTER TABLE accounts ADD COLUMN role_name TEXT DEFAULT ''");
+      }
     }
+
+    // ======== 数据修复：为老账号补 role_name ========
+    try {
+      const rows = queryAll("SELECT id, name, role_name FROM accounts WHERE role_name = '' OR role_name IS NULL");
+      for (const row of rows) {
+        const name = row.name || '';
+        if (!name.includes('-')) continue;
+        // 按最后一个 '-' 分割，前面作为角色名，后面作为区服
+        const parts = name.split('-');
+        const roleName = parts.slice(0, -1).join('-');
+        if (roleName) {
+          db.run("UPDATE accounts SET role_name = ? WHERE id = ?", [roleName, row.id]);
+        }
+      }
+    } catch {}
 
     // ======== 数据库迁移：为其他旧表添加 user_key 字段 ========
     const migrateUserKey = (tableName) => {
