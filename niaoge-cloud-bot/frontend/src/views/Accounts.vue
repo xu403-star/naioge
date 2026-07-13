@@ -550,9 +550,11 @@ function carStatusData(id) {
   const status = cached?.carStatus
   if (!status) return { text: '赛车未查询', type: 'default' }
   if (!status.open) return { text: '赛车未开放', type: 'default' }
-  if (status.claimable > 0) return { text: `${status.claimable}辆可收`, type: 'warning' }
-  if (status.total > 0 && status.sent >= status.total) return { text: '已发车', type: 'success' }
-  return { text: `已发 ${status.sent}/${status.total}`, type: 'warning' }
+  const total = status.total || 0
+  const sent = status.sent || 0
+  if (total > 0 && sent >= total) return { text: '已发车', type: 'success' }
+  if (total > 0) return { text: `已发 ${sent}/${total}`, type: 'warning' }
+  return { text: '赛车未查询', type: 'default' }
 }
 
 function carStatusText(id) {
