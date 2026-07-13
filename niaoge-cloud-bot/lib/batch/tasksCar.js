@@ -191,6 +191,20 @@ export class CarTasks {
     const acc = db.getAccount(accountId);
     const name = acc?.name || accountId;
 
+    // 局部日志函数，避免并发时 this.callbacks 被覆盖导致日志串号
+    const log = (msg, type = "info") => {
+      const entry = {
+        time: new Date().toLocaleTimeString(),
+        message: msg,
+        type,
+      };
+      if (typeof callbacks === "function") {
+        callbacks(entry);
+      } else if (callbacks && typeof callbacks.onLog === "function") {
+        callbacks.onLog(entry);
+      }
+    };
+
     const thresholds = {
       gold: Number(options.thresholds?.gold ?? DEFAULT_CAR_THRESHOLDS.gold),
       recruit: Number(
@@ -205,7 +219,7 @@ export class CarTasks {
     const delayAction = Number(options.delay?.action ?? options.actionDelay ?? 300);
     const delayRefresh = Number(options.delay?.refresh ?? options.refreshDelay ?? 1000);
 
-    this.log(`[${name}] === 智能发车 ===`);
+    log(`[${name}] === 智能发车 ===`);
     await this.pool.ensureConnected(accountId);
 
     try {
@@ -220,7 +234,7 @@ export class CarTasks {
 
       // 2. 获取刷新券
       let refreshTickets = await this.getRefreshTickets(accountId);
-      this.log(`[${name}] 刷新券: ${refreshTickets}`);
+      log(`[${name}] 刷新券: ${refreshTickets}`);
 
       // 3. 获取当前角色 ID 与护卫列表
       let helpers = [];
@@ -232,7 +246,7 @@ export class CarTasks {
         helperUsage = await this.getHelperUsage(accountId);
 
         if (helpers.length) {
-          this.log(`[${name}] 获取到 ${helpers.length} 位潜在护卫`);
+          log(`[${name}] 获取到 ${helpers.length} 位潜在护卫`);
         }
       }
 
@@ -245,7 +259,7 @@ export class CarTasks {
           if (shouldSendCarSimple(car, thresholds)) {
             const stopResult = checkStopCondition(car.rewards, thresholds);
             if (assignHelperEnabled) await this.assignHelper(accountId, car, helpers, helperUsage);
-            this.log(
+            log(
               `车辆[${gradeLabel(car.color)}]满足保底条件(${stopResult.reason})，直接发车`
             );
             await this.exec(accountId, "car_send", {
@@ -267,7 +281,7 @@ export class CarTasks {
 
           if (!shouldRefresh) {
             if (assignHelperEnabled) await this.assignHelper(accountId, car, helpers, helperUsage);
-            this.log(
+            log(
               `车辆[${gradeLabel(car.color)}]没有免费刷新次数且刷新券不足，直接发车`,
               "warning"
             );
@@ -284,7 +298,7 @@ export class CarTasks {
 
           // 刷新循环
           while (shouldRefresh && Number(car.sendAt || 0) === 0) {
-            this.log(`车辆[${gradeLabel(car.color)}]尝试刷新(保底模式)...`);
+            log(`车辆[${gradeLabel(car.color)}]尝试刷新(保底模式)...`);
             const resp = await this.exec(
               accountId,
               "car_refresh",
@@ -307,7 +321,7 @@ export class CarTasks {
             if (shouldSendCarSimple(car, thresholds)) {
               const stopResult = checkStopCondition(car.rewards, thresholds);
               if (assignHelperEnabled) await this.assignHelper(accountId, car, helpers, helperUsage);
-              this.log(
+              log(
                 `刷新后车辆[${gradeLabel(car.color)}]满足保底条件(${stopResult.reason})，发车`,
                 "success"
               );
@@ -328,7 +342,7 @@ export class CarTasks {
             else if (refreshTickets > 0) shouldRefresh = true;
             else {
               if (assignHelperEnabled) await this.assignHelper(accountId, car, helpers, helperUsage);
-              this.log(
+              log(
                 `车辆[${gradeLabel(car.color)}]没有免费刷新次数且刷新券不足，保底未满足直接发车`,
                 "warning"
               );
@@ -346,7 +360,7 @@ export class CarTasks {
             await new Promise((r) => setTimeout(r, delayRefresh));
           }
         } catch (carErr) {
-          this.log(`车辆处理失败: ${carErr.message}，跳过`, "error");
+          log(`车辆处理失败: ${carErr.message}，跳过`, "error");
         }
       }
 
@@ -355,9 +369,9 @@ export class CarTasks {
         await this.getStatus(accountId);
       } catch {}
 
-      this.log(`[${name}] 智能发车完成，共发 ${sentCount} 辆`, "success");
+      log(`[${name}] 智能发车完成，共发 ${sentCount} 辆`, "success");
     } catch (e) {
-      this.log(`[${name}] 智能发车失败: ${e.message}`, "error");
+      log(`[${name}] 智能发车失败: ${e.message}`, "error");
     }
   }
 
@@ -406,7 +420,22 @@ export class CarTasks {
     this.callbacks = callbacks;
     const acc = db.getAccount(accountId);
     const name = acc?.name || accountId;
-    this.log(`[${name}] === 一键收车 ===`);
+
+    // 局部日志函数，避免并发时 this.callbacks 被覆盖导致日志串号
+    const log = (msg, type = "info") => {
+      const entry = {
+        time: new Date().toLocaleTimeString(),
+        message: msg,
+        type,
+      };
+      if (typeof callbacks === "function") {
+        callbacks(entry);
+      } else if (callbacks && typeof callbacks.onLog === "function") {
+        callbacks.onLog(entry);
+      }
+    };
+
+    log(`[${name}] === 一键收车 ===`);
     await this.pool.ensureConnected(accountId);
 
     try {
@@ -455,7 +484,7 @@ export class CarTasks {
               pieces = Number(
                 roleInfo?.items?.[ITEM_RESEARCH_PIECE]?.quantity || 0
               );
-              this.log(`改装升级成功，当前等级: ${refreshLevel}`, "success");
+              log(`改装升级成功，当前等级: ${refreshLevel}`, "success");
               await new Promise((r) => setTimeout(r, 300));
             } catch {
               break;
@@ -474,15 +503,15 @@ export class CarTasks {
 
           await new Promise((r) => setTimeout(r, 500));
         } catch (e) {
-          this.log(`收车失败: ${e.message}`, "warning");
+          log(`收车失败: ${e.message}`, "warning");
         }
       }
 
       if (claimed === 0)
-        this.log(`[${name}] 没有可收取的车辆`, "info");
-      else this.log(`[${name}] 收车完成，共收取 ${claimed} 辆`, "success");
+        log(`[${name}] 没有可收取的车辆`, "info");
+      else log(`[${name}] 收车完成，共收取 ${claimed} 辆`, "success");
     } catch (e) {
-      this.log(`[${name}] 收车失败: ${e.message}`, "error");
+      log(`[${name}] 收车失败: ${e.message}`, "error");
     }
   }
 }
