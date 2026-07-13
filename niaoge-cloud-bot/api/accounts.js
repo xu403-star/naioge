@@ -61,6 +61,7 @@ router.get("/", (req, res) => {
     platform: a.platform || "",
     level: a.level || 0,
     role_name: a.role_name || "",
+    role_id: a.role_id || "",
     last_login: a.last_login || "",
     import_method: a.import_method || "manual",
     upgraded_to_permanent: a.upgraded_to_permanent || 0,

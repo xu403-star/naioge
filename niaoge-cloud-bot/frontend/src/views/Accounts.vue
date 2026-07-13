@@ -847,6 +847,8 @@ function startStatusPolling() {
 async function refreshAccountStatus() {
   const connected = accounts.value.filter(a => a.status === 'connected')
   for (const acc of connected) {
+    // 该账号正在执行每日任务时，跳过状态轮询，避免任务完成后又触发查询重连
+    if (accountStatusMap[acc.id]?.pending) continue
     if (statusPollingSet.has(acc.id)) continue
     queryAccountStatus(acc.id)
   }
@@ -1044,17 +1046,19 @@ async function waitDailyCompleteAndRefresh(id) {
     await new Promise(r => setTimeout(r, 3000))
     try {
       const acc = accounts.value.find(a => a.id === id)
-      const name = acc?.name || id
+      // 优先用 roleId 匹配日志，账号 ID 作为兜底
+      const roleId = acc?.role_id
+      const idTag = roleId ? `[role:${roleId}]` : `[id:${id}]`
 
       // 从日志中检测该账号的每日任务是否已完成
       const serverLogs = await api.get('/api/control/logs?limit=200')
       const completed = serverLogs.some(l =>
-        l.message && l.message.includes(`[${name}]`) && /手动每日任务完成|所有任务执行完成|每日任务完成/.test(l.message)
+        l.message && l.message.includes(idTag) && /手动每日任务完成|所有任务执行完成|每日任务完成/.test(l.message)
       )
       if (completed) {
         // 优先从最终活跃度日志解析实时分数，避免快照读不到最新值
         const finalLog = serverLogs.find(l =>
-          l.message && l.message.includes(`[${name}]`) && /最终活跃度:\s*\d+\/\d+/.test(l.message)
+          l.message && l.message.includes(idTag) && /最终活跃度:\s*\d+\/\d+/.test(l.message)
         )
         let parsedPoint = null
         let parsedMax = null
@@ -1065,6 +1069,7 @@ async function waitDailyCompleteAndRefresh(id) {
             parsedMax = parseInt(match[2], 10)
           }
         }
+        // 先把解析值写入状态，再读快照兜底；快照若过期/为0不覆盖解析值
         if (parsedPoint !== null) {
           const current = accountStatusMap[id] || {}
           accountStatusMap[id] = {
@@ -1077,8 +1082,8 @@ async function waitDailyCompleteAndRefresh(id) {
         // 任务完成：只读快照，不再触发连接，并把前端状态改为离线
         await loadAccountDailySnapshot(id)
         await loadAccountCarSnapshot(id)
-        // 如果快照返回过期/0分但日志已解析出有效值，恢复解析值
-        if (parsedPoint !== null && accountStatusMap[id]?.dailyPoint === 0) {
+        // 快照返回过期/0分时，恢复解析出的日志值
+        if (parsedPoint !== null && (!accountStatusMap[id]?.dailyPoint || accountStatusMap[id]?.dailyPoint === 0)) {
           accountStatusMap[id] = {
             ...(accountStatusMap[id] || {}),
             dailyPoint: parsedPoint,

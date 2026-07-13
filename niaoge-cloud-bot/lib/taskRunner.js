@@ -204,11 +204,16 @@ export class TaskRunner {
     this.pool = connectionPool;
     this.callbacks = {};
     this.carTasks = new CarTasks(connectionPool);
+    this.currentAccountName = "";
+    this.currentRoleId = "";
   }
 
   log(message, type = "info") {
     if (this.callbacks.onLog) {
-      this.callbacks.onLog({ time: new Date().toLocaleTimeString(), message, type });
+      const roleTag = this.currentRoleId ? `[role:${this.currentRoleId}]` : "";
+      const nameTag = this.currentAccountName ? `[${this.currentAccountName}]` : "";
+      const prefix = roleTag || nameTag ? `${roleTag}${nameTag} ` : "";
+      this.callbacks.onLog({ time: new Date().toLocaleTimeString(), message: prefix + message, type });
     }
   }
 
@@ -319,12 +324,12 @@ export class TaskRunner {
         const account = db.getAccount(accountId);
         const accountName = account?.name || accountId;
         try {
-          this.log(`[${accountName}] 预刷新 Token...`);
+          this.log("预刷新 Token...");
           await this.pool.refreshToken(accountId);
-          this.log(`[${accountName}] Token 预刷新成功`, "success");
+          this.log("Token 预刷新成功", "success");
           results.refreshed.push(accountId);
         } catch (error) {
-          this.log(`[${accountName}] Token 预刷新失败: ${error.message}`, "error");
+          this.log(`Token 预刷新失败: ${error.message}`, "error");
           results.failed.push({ accountId, error: error.message });
         }
       });
@@ -352,7 +357,10 @@ export class TaskRunner {
     const account = db.getAccount(accountId);
     const accountName = account?.name || accountId;
 
-    this.log(`[${accountName}] 开始每日任务`);
+    this.currentAccountName = accountName;
+    this.currentRoleId = "";
+
+    this.log(`开始每日任务`);
 
     // 新任务开始前清除可能残留的手动中止标记，避免上一次的断开操作影响本次任务
     this.pool.clearAbort(accountId);
@@ -378,10 +386,13 @@ export class TaskRunner {
     const roleData = roleInfoResp?.role;
     if (!roleData) throw new Error("角色数据不存在");
 
+    // 记录 roleId，后续日志用 [role:xxx][名字] 前缀，前端可按 roleId 精确匹配
+    this.currentRoleId = roleData.roleId || roleData.id || "";
+
     // 更新角色信息到DB
     try {
       db.updateAccount(accountId, {
-        role_id: roleData.roleId || roleData.id || "",
+        role_id: this.currentRoleId,
         role_name: roleData.name || "",
         level: roleData.level || 0,
       });
@@ -881,7 +892,7 @@ export class TaskRunner {
 
     // ======== 执行任务列表 ========
     const totalTasks = taskList.length;
-    this.log(`[${accountName}] 共有 ${totalTasks} 个任务待执行`);
+    this.log(`共有 ${totalTasks} 个任务待执行`);
 
     // 判断是否为连接/Token 类错误（需要刷新 token 重试）
     const isConnectionError = (errMsg) => {
@@ -893,7 +904,7 @@ export class TaskRunner {
 
       // 如果用户手动点击了断开/断开全部，停止继续执行任务
       if (this.pool.isAborted(accountId)) {
-        this.log(`[${accountName}] 检测到手动断开，停止执行任务`, "warning");
+        this.log("检测到手动断开，停止执行任务", "warning");
         break;
       }
 
@@ -901,7 +912,7 @@ export class TaskRunner {
       if (this.pool.getStatus(accountId) !== "connected") {
         // 重连前再次检查是否被手动中止，避免用户断开后又自动连上
         if (this.pool.isAborted(accountId)) {
-          this.log(`[${accountName}] 手动断开状态下不再重连，停止执行任务`, "warning");
+          this.log("手动断开状态下不再重连，停止执行任务", "warning");
           break;
         }
         this.log(`连接已断开，尝试重连后继续...`, "warning");
@@ -1035,21 +1046,23 @@ export class TaskRunner {
       const finalResp = await this.pool.sendMessage(accountId, "role_getroleinfo", {}, 5000);
       const finalDailyTask = finalResp?.role?.dailyTask ?? {};
       const { point: finalPoint, max: finalMax } = getDailyPointInfo(finalDailyTask);
-      this.log(`[${accountName}] 最终活跃度: ${finalPoint}/${finalMax}`, "success");
+      this.log(`最终活跃度: ${finalPoint}/${finalMax}`, "success");
       // 把最终活跃度写入账号 settings，刷新页面也不会丢失
       saveDailySnapshot(accountId, finalPoint, finalMax);
     } catch (e) { /* ignore */ }
 
     if (this.callbacks.onProgress) this.callbacks.onProgress(100);
-    this.log(`[${accountName}] 所有任务执行完成`, "success");
+    this.log("所有任务执行完成", "success");
     } finally {
       // 任务执行完毕后释放任务槽位（同时断开连接）
-      this.log(`[${accountName}] 释放任务槽位并断开连接`, "info");
+      this.log("释放任务槽位并断开连接", "info");
       try {
         await this.pool.releaseTaskSlot(accountId);
       } catch (e) {
-        this.log(`[${accountName}] 释放任务槽位时出错: ${e.message}`, "warning");
+        this.log(`释放任务槽位时出错: ${e.message}`, "warning");
       }
+      this.currentAccountName = "";
+      this.currentRoleId = "";
     }
   }
 }
