@@ -210,9 +210,8 @@ export class TaskRunner {
 
   log(message, type = "info") {
     if (this.callbacks.onLog) {
-      const roleTag = this.currentRoleId ? `[role:${this.currentRoleId}]` : "";
       const nameTag = this.currentAccountName ? `[${this.currentAccountName}]` : "";
-      const prefix = roleTag || nameTag ? `${roleTag}${nameTag} ` : "";
+      const prefix = nameTag ? `${nameTag} ` : "";
       this.callbacks.onLog({ time: new Date().toLocaleTimeString(), message: prefix + message, type });
     }
   }
@@ -355,7 +354,7 @@ export class TaskRunner {
       settings = { ...settings, smartSendCarEnable: false, claimCarsEnable: false };
     }
     const account = db.getAccount(accountId);
-    const accountName = account?.name || accountId;
+    const accountName = account?.role_name || account?.name || accountId;
 
     this.currentAccountName = accountName;
     this.currentRoleId = "";
