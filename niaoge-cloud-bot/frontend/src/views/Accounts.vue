@@ -1045,6 +1045,8 @@ async function waitDailyCompleteAndRefresh(id) {
   for (let i = 0; i < 60; i++) {
     await new Promise(r => setTimeout(r, 3000))
     try {
+      // 每次轮询前刷新账号信息，确保能拿到 taskRunner 写入的最新 role_id
+      await loadAccounts()
       const acc = accounts.value.find(a => a.id === id)
       // 优先用 roleId 匹配日志，账号 ID 作为兜底
       const roleId = acc?.role_id
@@ -1292,6 +1294,9 @@ function startPollingRunStatus() {
         clearInterval(statusTimer)
         running.value = false
         await loadAccounts()
+        for (const id of Object.keys(status.status || {})) {
+          await loadAccountCarSnapshot(id)
+        }
         addLog(`[${currentOperationLabel.value || '批量任务'}] 全部执行完成`, 'success')
       }
     } catch (e) {

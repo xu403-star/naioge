@@ -350,6 +350,11 @@ export class CarTasks {
         }
       }
 
+      try {
+        // 发车完成后重新查询车辆状态并保存快照，供前端账号栏实时显示
+        await this.getStatus(accountId);
+      } catch {}
+
       this.log(`[${name}] 智能发车完成，共发 ${sentCount} 辆`, "success");
     } catch (e) {
       this.log(`[${name}] 智能发车失败: ${e.message}`, "error");

@@ -1165,9 +1165,15 @@ app.get("/api/game/last-car-status/:id", (req, res) => {
   const snapshotDay = settings.lastCarDay || null;
   const expired = !snapshotDay || snapshotDay !== todayDay;
 
+  // 赛车开放状态必须按当前日期重新计算，避免过期快照里的旧 open 值误导前端
+  const wd = today.getDay();
+  const hour = today.getHours();
+  const open = wd >= 1 && wd <= 3 && hour < 20;
+
   res.json({
     ...{ open: false, sent: 0, total: 0, claimable: 0, cars: [] },
     ...(settings.lastCarStatus || {}),
+    open,
     expired
   });
 });
