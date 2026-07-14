@@ -58,7 +58,29 @@ const PORT = process.env.PORT || 3456;
 const pool = new ConnectionPool();
 setAccountsPool(pool);
 const taskRunner = new TaskRunner(pool);
-const scheduler = new Scheduler(pool, taskRunner);
+const scheduler = new Scheduler(pool, taskRunner, {
+  maxActive: 2,
+  taskHandlers: {
+    daily: async (accountId, log) => {
+      const account = db.getAccount(accountId);
+      await taskRunner.run(accountId, {
+        onLog: (entry) => {
+          log(entry.message, entry.type || "info");
+          db.addLog(accountId, account?.name || accountId, "daily", entry.message, entry.type || "info", account?.user_key);
+        },
+        onProgress: () => {},
+      });
+    },
+    connect: async (accountId, log) => {
+      await pool.ensureConnected(accountId);
+      log("已连接");
+    },
+    disconnect: async (accountId, log) => {
+      await pool.disconnect(accountId);
+      log("已断开");
+    },
+  },
+});
 setTasksScheduler(scheduler);
 
 // 批量模块实例
@@ -1330,7 +1352,7 @@ async function start() {
     console.log(`========================================\n`);
 
     // 启动定时任务（任务执行时会按需连接账号，避免启动时并发连接风暴）
-    scheduler.init();
+    scheduler.init('admin');
   });
 }
 

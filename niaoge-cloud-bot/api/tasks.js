@@ -15,7 +15,19 @@ const TYPE_MAP = {
   "daily-all": ["daily"],
   "connect-all": ["connect"],
   "disconnect-all": ["disconnect"],
+  "daily-then-disconnect": ["daily", "disconnect"],
 };
+
+/**
+ * 把 HH:mm 固定时间转成 5 字段 cron 表达式
+ */
+function fixedTimeToCron(t) {
+  const [h, m] = t.split(":").map(Number);
+  if (isNaN(h) || isNaN(m) || h < 0 || h > 23 || m < 0 || m > 59) {
+    throw new Error("无效的固定时间");
+  }
+  return `${m} ${h} * * *`;
+}
 
 /** 获取所有定时任务 */
 router.get("/", (req, res) => {
@@ -33,12 +45,23 @@ router.get("/:id", (req, res) => {
 /** 创建定时任务 */
 router.post("/", (req, res) => {
   try {
-    const { name, cronExpression, cron, type, taskList, accountIds, enabled } = req.body;
+    const { name, cronExpression, cron, scheduleType, fixedTime, type, taskList, accountIds, maxActive, enabled } = req.body;
 
-    // 兼容前端 cronExpression / cron 两种字段名
-    const cronExpr = cronExpression || cron;
-    if (!name || !cronExpr) {
-      return res.status(400).json({ error: "缺少必填字段: name, cronExpression" });
+    const sType = scheduleType || "cron";
+    let cronExpr = cronExpression || cron;
+
+    // 固定时间类型：校验并转换
+    if (sType === "fixed") {
+      if (!fixedTime) {
+        return res.status(400).json({ error: "缺少必填字段: fixedTime" });
+      }
+      try {
+        cronExpr = fixedTimeToCron(fixedTime);
+      } catch (e) {
+        return res.status(400).json({ error: e.message });
+      }
+    } else if (!cronExpr) {
+      return res.status(400).json({ error: "缺少必填字段: cronExpression" });
     }
 
     // type → taskList 转换
@@ -46,9 +69,12 @@ router.post("/", (req, res) => {
 
     const result = db.addSchedule({
       name,
+      scheduleType: sType,
+      fixedTime: fixedTime || "",
       cronExpression: cronExpr,
       taskList: tasks,
       accountIds: accountIds || "*",
+      maxActive: Number(maxActive) || 2,
       enabled: enabled ?? 1,
       userKey: req.userKey,
     });
@@ -69,11 +95,22 @@ router.post("/", (req, res) => {
 router.put("/:id", (req, res) => {
   try {
     const id = Number(req.params.id);
-    db.updateSchedule(id, req.body, req.userKey);
+    const body = { ...req.body };
+
+    // 如果改为固定时间，重新转换 cron
+    if (body.scheduleType === "fixed" && body.fixedTime) {
+      try {
+        body.cronExpression = fixedTimeToCron(body.fixedTime);
+      } catch (e) {
+        return res.status(400).json({ error: e.message });
+      }
+    }
+
+    db.updateSchedule(id, body, req.userKey);
     res.json({ success: true });
 
     // 更新后重新加载调度器
-    if (schedulerRef) schedulerRef.reload();
+    if (schedulerRef) schedulerRef.reload(req.userKey);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -87,7 +124,7 @@ router.delete("/:id", (req, res) => {
     res.json({ success: true });
 
     // 删除后重新加载调度器
-    if (schedulerRef) schedulerRef.reload();
+    if (schedulerRef) schedulerRef.reload(req.userKey);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

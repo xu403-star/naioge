@@ -4,11 +4,40 @@
 import cron from "node-cron";
 import * as db from "./db.js";
 
+/**
+ * 通用并发控制辅助：按指定并发数同时执行多个任务
+ */
+async function runWithConcurrency(items, limit, fn) {
+  const executing = new Set();
+  for (const item of items) {
+    const p = fn(item).finally(() => executing.delete(p));
+    executing.add(p);
+    if (executing.size >= limit) await Promise.race(executing);
+  }
+  await Promise.all(executing);
+}
+
+/**
+ * 把 HH:mm 固定时间转成 node-cron 表达式（每天）
+ */
+function fixedTimeToCron(fixedTime) {
+  const [h, m] = fixedTime.split(":").map(Number);
+  if (isNaN(h) || isNaN(m) || h < 0 || h > 23 || m < 0 || m > 59) {
+    throw new Error(`无效的固定时间: ${fixedTime}`);
+  }
+  return `${m} ${h} * * *`;
+}
+
 export class Scheduler {
-  constructor(connectionPool, taskRunner) {
+  constructor(connectionPool, taskRunner, options = {}) {
     this.pool = connectionPool;
     this.taskRunner = taskRunner;
+    this.options = options;
+    this.taskHandlers = options.taskHandlers || {};
+    this.defaultMaxActive = options.maxActive || 2;
     this.jobs = new Map(); // scheduleId -> cronJob
+    this.running = new Map(); // scheduleId -> Promise
+    this.lastRunMinute = new Map(); // scheduleId -> YYYY-MM-DDTHH:mm
     this.onLog = null;
   }
 
@@ -21,8 +50,8 @@ export class Scheduler {
   /**
    * 初始化：加载所有启用的定时任务
    */
-  init() {
-    const schedules = db.getEnabledSchedules();
+  init(userKey) {
+    const schedules = db.getEnabledSchedules(userKey);
     this.log(`加载了 ${schedules.length} 个定时任务配置`);
     for (const schedule of schedules) {
       this.registerSchedule(schedule);
@@ -33,20 +62,35 @@ export class Scheduler {
    * 注册单个定时任务
    */
   registerSchedule(schedule) {
-    const { id, name, cron_expression, task_list, account_ids } = schedule;
-
-    // 验证 cron 表达式
-    if (!cron.validate(cron_expression)) {
-      this.log(`[${name}] Cron 表达式无效: ${cron_expression}`, "error");
-      return;
-    }
+    const { id, name, schedule_type, fixed_time, cron_expression, task_list, account_ids, max_active } = schedule;
 
     // 解析任务列表
     let tasks;
     try {
       tasks = typeof task_list === "string" ? JSON.parse(task_list) : task_list;
+      if (!Array.isArray(tasks) || tasks.length === 0) {
+        this.log(`[${name}] 任务列表为空，跳过`, "warning");
+        return;
+      }
     } catch (e) {
       this.log(`[${name}] 任务列表解析失败: ${e.message}`, "error");
+      return;
+    }
+
+    // 确定最终 cron 表达式
+    let cronExpr = cron_expression;
+    if (schedule_type === "fixed" && fixed_time) {
+      try {
+        cronExpr = fixedTimeToCron(fixed_time);
+      } catch (e) {
+        this.log(`[${name}] ${e.message}`, "error");
+        return;
+      }
+    }
+
+    // 验证 cron 表达式
+    if (!cron.validate(cronExpr)) {
+      this.log(`[${name}] Cron 表达式无效: ${cronExpr}`, "error");
       return;
     }
 
@@ -60,11 +104,41 @@ export class Scheduler {
       return;
     }
 
-    // 创建 cron job
-    const job = cron.schedule(cron_expression, async () => {
-      this.log(`[${name}] 触发定时任务 (${accountIds.length} 个账号)`);
+    const maxActive = Math.max(1, Number(max_active) || this.defaultMaxActive);
 
-      // 批量预刷新 Token，避免执行中途过期
+    // 创建 cron job
+    const job = cron.schedule(cronExpr, async () => {
+      // 防止同一任务重叠执行
+      if (this.running.has(id)) {
+        this.log(`[${name}] 跳过：上次执行尚未结束`);
+        return;
+      }
+
+      // 防止同一分钟内重复触发（node-cron 某些情况下可能重复）
+      const minuteKey = new Date().toISOString().slice(0, 16);
+      if (this.lastRunMinute.get(id) === minuteKey) {
+        this.log(`[${name}] 跳过：本分钟已触发过`);
+        return;
+      }
+      this.lastRunMinute.set(id, minuteKey);
+
+      const runPromise = this._executeSchedule(id, name, tasks, accountIds, maxActive);
+      this.running.set(id, runPromise);
+      runPromise.finally(() => this.running.delete(id));
+    });
+
+    this.jobs.set(id, job);
+    this.log(`[${name}] 已注册: ${cronExpr} → ${accountIds.length} 个账号，并发 ${maxActive}`);
+  }
+
+  /**
+   * 执行一次调度任务
+   */
+  async _executeSchedule(id, name, tasks, accountIds, maxActive) {
+    this.log(`[${name}] 触发定时任务 (${accountIds.length} 个账号，并发 ${maxActive})`);
+
+    // 如果包含每日任务，提前刷新 Token（最佳努力）
+    if (tasks.includes("daily")) {
       try {
         await this.taskRunner.preRefreshTokens(accountIds, {
           onLog: (entry) => this.log(`[${name}] ${entry.message}`, entry.type || "info"),
@@ -72,42 +146,38 @@ export class Scheduler {
       } catch (error) {
         this.log(`[${name}] 批量预刷新 Token 失败: ${error.message}`, "error");
       }
+    }
 
-      for (const accountId of accountIds) {
-        const account = db.getAccount(accountId);
-        if (!account || !account.enabled) {
-          this.log(`[${name}] 跳过已禁用账号: ${accountId}`, "warning");
-          continue;
-        }
-
-        this.log(`[${name}] 开始执行账号: ${account.name}`);
-
-        try {
-          await this.taskRunner.run(accountId, {
-            onLog: (entry) => {
-              this.log(`[${account.name}] ${entry.message}`, entry.type || "info");
-              db.addLog(accountId, account.name, entry.message, entry.type || "info", "");
-            },
-            onProgress: (pct) => {
-              // 进度回调（可扩展）
-            },
-          });
-          db.addLog(accountId, account.name, name, "success", "任务完成");
-          this.log(`[${name}] ${account.name}: 全部完成`, "success");
-        } catch (error) {
-          this.log(`[${name}] ${account.name}: 执行失败 - ${error.message}`, "error");
-          db.addLog(accountId, account.name, name, "error", error.message);
-        }
-
-        // 账号间延迟
-        await new Promise(r => setTimeout(r, 3000));
+    await runWithConcurrency(accountIds, maxActive, async (accountId) => {
+      const account = db.getAccount(accountId);
+      if (!account || !account.enabled) {
+        this.log(`[${name}] 跳过已禁用账号: ${accountId}`, "warning");
+        return;
       }
 
-      this.log(`[${name}] 定时任务执行完毕`, "success");
+      const accountLog = (msg, level = "info") => {
+        this.log(`[${name}] [${account.name}] ${msg}`, level);
+      };
+
+      try {
+        for (const task of tasks) {
+          const handler = this.taskHandlers[task];
+          if (!handler) {
+            accountLog(`未知任务: ${task}`, "warning");
+            continue;
+          }
+          accountLog(`开始执行: ${task}`);
+          await handler(accountId, accountLog);
+        }
+        db.addLog(accountId, account.name, name, "success", "任务完成");
+        this.log(`[${name}] ${account.name}: 全部完成`, "success");
+      } catch (error) {
+        this.log(`[${name}] ${account.name}: 执行失败 - ${error.message}`, "error");
+        db.addLog(accountId, account.name, name, "error", error.message);
+      }
     });
 
-    this.jobs.set(id, job);
-    this.log(`[${name}] 已注册: ${cron_expression} → ${accountIds.length} 个账号`);
+    this.log(`[${name}] 定时任务执行完毕`, "success");
   }
 
   /**
@@ -118,9 +188,12 @@ export class Scheduler {
       // 生成ID
       schedule.id = db.addSchedule({
         name: schedule.name,
+        scheduleType: schedule.schedule_type,
+        fixedTime: schedule.fixed_time,
         cronExpression: schedule.cron_expression,
         taskList: schedule.task_list,
         accountIds: schedule.account_ids || "*",
+        maxActive: schedule.max_active,
         enabled: schedule.enabled ?? 1,
       }).lastInsertRowid;
     }
@@ -143,15 +216,17 @@ export class Scheduler {
   /**
    * 重新加载所有定时任务
    */
-  reload() {
+  reload(userKey) {
     // 停止所有
     for (const [id, job] of this.jobs) {
       job.stop();
     }
     this.jobs.clear();
+    this.running.clear();
+    this.lastRunMinute.clear();
 
     // 重新加载
-    this.init();
+    this.init(userKey);
   }
 
   /**
@@ -162,6 +237,8 @@ export class Scheduler {
       job.stop();
     }
     this.jobs.clear();
+    this.running.clear();
+    this.lastRunMinute.clear();
     this.log("所有定时任务已停止");
   }
 

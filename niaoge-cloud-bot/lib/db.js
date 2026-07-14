@@ -86,9 +86,12 @@ export async function initDatabase() {
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_key TEXT DEFAULT 'default',
         name TEXT NOT NULL,
+        schedule_type TEXT DEFAULT 'cron',
+        fixed_time TEXT DEFAULT '',
         cron_expression TEXT NOT NULL,
         task_list TEXT NOT NULL,
         account_ids TEXT DEFAULT '*',
+        max_active INTEGER DEFAULT 2,
         enabled INTEGER DEFAULT 1,
         created_at TEXT DEFAULT (datetime('now','localtime')),
         updated_at TEXT DEFAULT (datetime('now','localtime'))
@@ -192,6 +195,21 @@ export async function initDatabase() {
     migrateUserKey('task_logs');
     migrateUserKey('task_templates');
     migrateUserKey('user_settings');
+
+    // ======== 数据库迁移：为 task_schedules 添加新字段 ========
+    const scheduleCols = queryAll("PRAGMA table_info(task_schedules)");
+    if (scheduleCols.length) {
+      const colNames = scheduleCols.map(c => c.name);
+      if (!colNames.includes('schedule_type')) {
+        db.run("ALTER TABLE task_schedules ADD COLUMN schedule_type TEXT DEFAULT 'cron'");
+      }
+      if (!colNames.includes('fixed_time')) {
+        db.run("ALTER TABLE task_schedules ADD COLUMN fixed_time TEXT DEFAULT ''");
+      }
+      if (!colNames.includes('max_active')) {
+        db.run("ALTER TABLE task_schedules ADD COLUMN max_active INTEGER DEFAULT 2");
+      }
+    }
 
     // 创建默认管理员（如果不存在）
     const adminExists = queryOne("SELECT * FROM users WHERE user_key = 'admin'");
@@ -453,22 +471,32 @@ export function getEnabledSchedules(userKey) {
 }
 
 export function addSchedule(data) {
+  const scheduleType = data.scheduleType || 'cron';
+  const fixedTime = data.fixedTime || '';
+  const maxActive = data.maxActive ?? 2;
   if (data.id) {
-    exec(`INSERT OR REPLACE INTO task_schedules (id, user_key, name, cron_expression, task_list, account_ids, enabled, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now','localtime'))`,
-      [data.id, data.userKey || 'default', data.name, data.cronExpression, JSON.stringify(data.taskList),
-       data.accountIds || '*', data.enabled ?? 1]);
+    exec(`INSERT OR REPLACE INTO task_schedules (id, user_key, name, schedule_type, fixed_time, cron_expression, task_list, account_ids, max_active, enabled, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now','localtime'))`,
+      [data.id, data.userKey || 'default', data.name, scheduleType, fixedTime, data.cronExpression,
+       JSON.stringify(data.taskList), data.accountIds || '*', maxActive, data.enabled ?? 1]);
     return { lastInsertRowid: data.id };
   }
-  const id = execGetId(`INSERT INTO task_schedules (user_key, name, cron_expression, task_list, account_ids, enabled, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, datetime('now','localtime'))`,
-    [data.userKey || 'default', data.name, data.cronExpression, JSON.stringify(data.taskList),
-     data.accountIds || '*', data.enabled ?? 1]);
+  const id = execGetId(`INSERT INTO task_schedules (user_key, name, schedule_type, fixed_time, cron_expression, task_list, account_ids, max_active, enabled, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now','localtime'))`,
+    [data.userKey || 'default', data.name, scheduleType, fixedTime, data.cronExpression,
+     JSON.stringify(data.taskList), data.accountIds || '*', maxActive, data.enabled ?? 1]);
   return { lastInsertRowid: id };
 }
 
 export function updateSchedule(id, data, userKey) {
-  const map = { cronExpression: "cron_expression", taskList: "task_list", accountIds: "account_ids" };
+  const map = {
+    cronExpression: "cron_expression",
+    scheduleType: "schedule_type",
+    fixedTime: "fixed_time",
+    taskList: "task_list",
+    accountIds: "account_ids",
+    maxActive: "max_active",
+  };
   const fields = [];
   const values = [];
   for (const [k, v] of Object.entries(data)) {
