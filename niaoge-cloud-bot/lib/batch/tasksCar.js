@@ -223,6 +223,14 @@ export class CarTasks {
     await this.pool.ensureConnected(accountId);
 
     try {
+      // 0. 发车前先尝试收车，避免昨天未收的车占用车位导致统计错误
+      try {
+        log(`[${name}] 智能发车前尝试一键收车...`);
+        await this.claimAll(accountId, callbacks);
+      } catch (e) {
+        log(`[${name}] 发车前收车失败: ${e.message}，继续发车`, "warning");
+      }
+
       // 1. 获取车辆列表
       const carRes = await this.exec(
         accountId,
