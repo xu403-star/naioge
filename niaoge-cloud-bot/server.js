@@ -1200,7 +1200,9 @@ app.get("/api/game/last-car-status/:id", (req, res) => {
     ...{ open: false, sent: 0, total: 0, claimable: 0, cars: [] },
     ...(settings.lastCarStatus || {}),
     open,
-    expired
+    expired,
+    // 快照过期时重置今日发车进度，避免显示昨天的已完成状态
+    ...(expired ? { sent: 0, claimable: 0, cars: [] } : {}),
   });
 });
 

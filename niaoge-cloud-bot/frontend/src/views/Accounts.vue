@@ -1048,10 +1048,11 @@ async function waitDailyCompleteAndRefresh(id) {
     try {
       const serverLogs = await api.get('/api/control/logs?limit=200')
 
-      // 1. 解析活跃度实时推送
-      const updateLog = serverLogs.find(l =>
+      // 1. 解析活跃度实时推送（取最新一条）
+      const updateLogs = serverLogs.filter(l =>
         l.accountId === id && l.message?.startsWith('__DAILY_POINT_UPDATE__:')
       )
+      const updateLog = updateLogs[updateLogs.length - 1]
       if (updateLog) {
         const match = updateLog.message.match(/:(\d+)\/(\d+)/)
         if (match) {
