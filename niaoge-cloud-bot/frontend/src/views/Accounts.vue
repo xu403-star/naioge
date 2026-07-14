@@ -1053,7 +1053,7 @@ async function waitDailyCompleteAndRefresh(id) {
         l.accountId === id && l.message?.startsWith('__DAILY_POINT_UPDATE__:')
       )
       if (updateLog) {
-        const match = updateLog.message.match(/__(\d+)\/(\d+)/)
+        const match = updateLog.message.match(/:(\d+)\/(\d+)/)
         if (match) {
           const point = parseInt(match[1], 10)
           const max = parseInt(match[2], 10)
@@ -1170,23 +1170,25 @@ async function disconnectAll() {
 
 async function batchDaily() {
   const ids = [...selectedIds.value]
-  addLog(`批量执行每日任务 ${ids.length} 个账号`)
-  for (const id of ids) {
-    const acc = accounts.value.find(a => a.id === id)
-    try {
-      const settings = await api.get(`/api/accounts/${id}/settings`).catch(() => ({}))
-      await api.post(`/api/control/run-daily/${id}`, { settings })
-      addLog(`[${acc?.name || id}] 每日任务已触发`, 'success')
-      // 先把账号标记为执行中状态，避免显示离线
-      if (acc) {
-        acc.status = 'connected'
-        accountStatusMap[acc.id] = { dailyPoint: 0, dailyPointMax: 100, pending: true }
+  const maxActive = Math.max(1, batchSettings.value.maxActive || 2)
+  addLog(`批量执行每日任务 ${ids.length} 个账号，并发 ${maxActive}`)
+  for (let i = 0; i < ids.length; i += maxActive) {
+    const batch = ids.slice(i, i + maxActive)
+    await Promise.all(batch.map(async (id) => {
+      const acc = accounts.value.find(a => a.id === id)
+      try {
+        const settings = await api.get(`/api/accounts/${id}/settings`).catch(() => ({}))
+        await api.post(`/api/control/run-daily/${id}`, { settings })
+        addLog(`[${acc?.name || id}] 每日任务已触发`, 'success')
+        if (acc) {
+          acc.status = 'connected'
+          accountStatusMap[acc.id] = { dailyPoint: 0, dailyPointMax: 100, pending: true }
+        }
+        await waitDailyCompleteAndRefresh(id)
+      } catch (e) {
+        addLog(`[${acc?.name || id}] 每日任务失败: ${e.message}`, 'error')
       }
-      // 每个账号触发后独立轮询刷新，不阻塞后续触发
-      waitDailyCompleteAndRefresh(id)
-    } catch (e) {
-      addLog(`[${acc?.name || id}] 每日任务失败: ${e.message}`, 'error')
-    }
+    }))
   }
 }
 

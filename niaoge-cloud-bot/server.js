@@ -401,7 +401,7 @@ app.post("/api/control/run-daily/:id", async (req, res) => {
     // 异步执行，支持前端传递任务设置
     const customSettings = req.body?.settings || null;
     try {
-      await taskRunner.run(req.params.id, {
+      await new TaskRunner(pool).run(req.params.id, {
         onLog: (entry) => {
           addLog({ ...entry, accountId: req.params.id });
           db.addLog(req.params.id, account.name, "手动每日任务", entry.message, entry.type || "info", req.userKey);
