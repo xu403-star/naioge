@@ -4,7 +4,7 @@
 import { Router } from "express";
 import { readFileSync, unlinkSync } from "fs";
 import * as db from "../lib/db.js";
-import { getBinBase64Token, buildWsUrl, getServerList, getTokenId, transformToken, modifyBinServerId, parseBinData } from "../lib/tokenAuth.js";
+import { getBinBase64Token, buildWsUrl, getServerList, getTokenId, transformToken, modifyBinServerId, parseBinData, rateLimiter } from "../lib/tokenAuth.js";
 
 let poolRef = null;
 
@@ -46,6 +46,19 @@ function checkQuota(userKey) {
   const count = db.queryOne("SELECT COUNT(*) as cnt FROM accounts WHERE user_key = ?", [userKey]);
   return (count?.cnt || 0) < user.max_accounts;
 }
+
+/** 查询限流状态（供前端批次开始前显示倒计时） */
+router.get("/rate-limit-status", (req, res) => {
+  const status = {
+    estimatedWaitMs: rateLimiter.getEstimatedWaitMs(),
+    queueSize: rateLimiter.queueSize,
+    windowRequests: rateLimiter.requests.length,
+    maxRequests: rateLimiter.maxRequests,
+    windowMs: rateLimiter.windowMs,
+  };
+  console.log(`[rate-limit-status] 估计等待=${status.estimatedWaitMs}ms 窗口内=${status.windowRequests}/${status.maxRequests} 队列=${status.queueSize}`);
+  res.json(status);
+});
 
 /** 获取所有账号 */
 router.get("/", (req, res) => {
@@ -102,6 +115,9 @@ router.post("/batch", async (req, res) => {
     const fileList = Array.isArray(files) ? files : [files];
     const results = [];
     const errors = [];
+
+    // 限流已统一在 transformToken 内部（lib/tokenAuth.js 的 authUserLimiter，25次/分钟）
+    // 这里不再重复实现，避免双重计数
 
     for (const binFile of fileList) {
       try {
@@ -178,7 +194,7 @@ router.post("/batch", async (req, res) => {
         // 分离纯角色名与显示名
         const pureRoleName = roleName.includes("-") ? roleName.split("-").slice(0, -1).join("-") : roleName;
 
-        // 调用 authuser API 获取 JSON Token
+        // 调用 authuser API 获取 JSON Token（限流由 transformToken 内部统一处理）
         let jsonToken;
         try {
           jsonToken = await transformToken(binArrayBuffer);
@@ -213,6 +229,7 @@ router.post("/batch", async (req, res) => {
 
 /** 单个 BIN 添加：支持 multipart 文件上传 或 JSON Base64 */
 router.post("/bin", async (req, res) => {
+  const t0 = Date.now();
   try {
     let binArrayBuffer;
     let autoName;
@@ -243,47 +260,58 @@ router.post("/bin", async (req, res) => {
       return res.status(403).json({ error: "已达账号配额上限，请联系管理员" });
     }
 
-    // 从 BIN 内容解析真实角色名（避免文件名中文乱码）
-    // 注意：parse/getServerList 会原地修改 buffer，所以必须复制一份用于解析
+    // ======== 并行：角色名解析（getServerList）+ Token 获取（transformToken） ========
+    // 两者互不依赖：getServerList 用 parseBuffer 副本，transformToken 用原始 binArrayBuffer
+    // 串行时 4-5 秒（2 个网络请求顺序执行），并行后约 2-2.5 秒（取最慢的那个）
+    const parseBuffer = binArrayBuffer.slice(0);
+    const t1 = Date.now();
+    const [serverListResult, tokenResult] = await Promise.allSettled([
+      autoName ? Promise.resolve(null) : getServerList(parseBuffer),
+      transformToken(binArrayBuffer),
+    ]);
+    const t2 = Date.now();
+    console.log(`[BIN] 网络请求耗时: ${t2 - t1}ms (getServerList + transformToken 并行，限流等待 ${rateLimiter.lastWaitMs}ms)`);
+
+    // Token 获取失败则跳过
+    if (tokenResult.status === 'rejected') {
+      return res.status(502).json({ error: `获取Token失败(BIN可能已过期): ${tokenResult.reason.message}` });
+    }
+    const jsonToken = tokenResult.value;
+    const wsUrl = buildWsUrl(jsonToken);
+
+    // 解析角色名
     let roleName = "";
-    if (!autoName) {
+    if (!autoName && serverListResult.status === 'fulfilled' && serverListResult.value) {
       try {
-        const parseBuffer = binArrayBuffer.slice(0);
-        const serverListJson = await getServerList(parseBuffer);
-        const rolesData = JSON.parse(serverListJson);
+        const rolesData = JSON.parse(serverListResult.value);
         const roles = Object.entries(rolesData).map(([id, info]) => ({ id, ...info }));
         const fileName = (req.files?.binFile?.name || '').replace(/\.bin$/i, "").trim();
         console.log(`[BIN单文件] 文件:${fileName} 角色数:${roles.length}`, roles.map(r => ({ name: r.name, serverId: r.serverId, id: r.id })));
 
-        // 优先用 BIN 文件自己的 serverId 精确匹配角色（parseBinData 已能正确返回编码后的 serverId）
+        // 优先用 BIN 文件自己的 serverId 精确匹配角色
+        // 注意：parseBuffer 已被 getServerList 修改，需要用新副本
         let originalServerId = null;
         try {
-          const binData = parseBinData(parseBuffer);
+          const binData = parseBinData(binArrayBuffer.slice(0));
           originalServerId = binData?.serverId ?? null;
         } catch (e) {
           console.error(`[BIN单文件] 解析原始serverId失败:`, e.message);
         }
 
-        // 文件名解析：去掉扩展名，提取末尾数字作为角色序号
         const indexMatch = fileName.match(/(\d+)$/);
         const fileIndex = indexMatch ? parseInt(indexMatch[1], 10) : null;
         const fileNameCn = fileName.replace(/\d+$/, "").trim();
 
         const matched =
-          // 1. 优先：BIN 原始 serverId 精确匹配
           (originalServerId !== null
             ? roles.find(r => Number(r.serverId) === Number(originalServerId))
             : null) ||
-          // 2. 精确匹配角色名 == 文件名
           roles.find(r => r.name === fileName) ||
-          // 3. 角色名 == 文件名中文 + 角色序号匹配
           (fileIndex !== null
             ? roles.find(r => r.name === fileNameCn && getRoleIndex(r.serverId) === fileIndex)
             : null) ||
-          // 4. 角色名包含文件名中文
           roles.find(r => r.name && r.name.includes(fileNameCn)) ||
           roles.find(r => r.name && fileNameCn.includes(r.name)) ||
-          // 5. 兜底第一个角色
           roles[0];
         console.log(`[BIN单文件] 文件:${fileName} 原始serverId:${originalServerId} 匹配到:`, matched?.name, matched?.serverId);
         if (matched?.name) {
@@ -293,19 +321,9 @@ router.post("/bin", async (req, res) => {
         }
       } catch (e) {
         console.error(`[BIN单文件] 解析角色失败:`, e.message, e.stack);
-        // 解析失败，用 tokenId 兜底
       }
     }
     if (!autoName) autoName = `账号_${tokenId.slice(0, 8)}`;
-
-    // 调用 authuser API 获取 JSON Token
-    let jsonToken;
-    try {
-      jsonToken = await transformToken(binArrayBuffer);
-    } catch (e) {
-      return res.status(502).json({ error: `获取Token失败(BIN可能已过期): ${e.message}` });
-    }
-    const wsUrl = buildWsUrl(jsonToken);
 
     db.addAccount({
       id: tokenId,
@@ -325,7 +343,8 @@ router.post("/bin", async (req, res) => {
       poolRef._tokenExpiredSignal?.delete(tokenId);
     }
 
-    res.json({ success: true, id: tokenId, name: autoName });
+    console.log(`[BIN] 总耗时: ${Date.now() - t0}ms (${autoName})`);
+    res.json({ success: true, id: tokenId, name: autoName, elapsed: Date.now() - t0, waitMs: rateLimiter.lastWaitMs });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -419,6 +438,36 @@ router.delete("/:id", (req, res) => {
   }
 });
 
+/** 批量删除账号 */
+router.post("/batch-delete", (req, res) => {
+  try {
+    const { ids } = req.body || {};
+    if (!Array.isArray(ids) || ids.length === 0) return res.status(400).json({ error: "缺少 ids 数组" });
+    const deleted = [];
+    const failed = [];
+    for (const id of ids) {
+      try {
+        if (!db.getAccount(id, req.userKey)) {
+          failed.push({ id, error: "账号不存在" });
+          continue;
+        }
+        db.removeAccount(id, req.userKey);
+        if (poolRef) {
+          poolRef._lastSuccessfulToken?.delete(id);
+          poolRef._lastRecvSeq?.delete(id);
+          poolRef._tokenExpiredSignal?.delete(id);
+        }
+        deleted.push(id);
+      } catch (e) {
+        failed.push({ id, error: e.message });
+      }
+    }
+    res.json({ success: true, deleted, failed, deletedCount: deleted.length });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 /** 刷新 Token */
 router.post("/:id/refresh-token", async (req, res) => {
   try {
@@ -426,6 +475,7 @@ router.post("/:id/refresh-token", async (req, res) => {
     if (!account) return res.status(404).json({ error: "账号不存在" });
 
     let jsonToken, wsUrl;
+    let waitedMs = 0;
 
     if (account.import_method === "url" && account.source_url) {
       // URL 形式：从 sourceUrl 拉取新 token
@@ -439,10 +489,12 @@ router.post("/:id/refresh-token", async (req, res) => {
       }
       wsUrl = buildWsUrl(jsonToken);
     } else if (account.bin_base64) {
-      // BIN 形式：重新调用 authuser
+      // BIN 形式：重新调用 authuser（受 authUserLimiter 25次/分钟限流）
       const binBuf = Buffer.from(account.bin_base64, "base64");
       const binArrayBuffer = binBuf.buffer.slice(binBuf.byteOffset, binBuf.byteOffset + binBuf.byteLength);
       jsonToken = await transformToken(binArrayBuffer);
+      // 读取本次 transformToken 在限流器内排队等待的毫秒数
+      waitedMs = rateLimiter.lastWaitMs || 0;
       wsUrl = buildWsUrl(jsonToken);
     } else {
       return res.status(400).json({ error: "无 BIN 数据或 sourceUrl，无法刷新 Token" });
@@ -457,7 +509,85 @@ router.post("/:id/refresh-token", async (req, res) => {
       poolRef._tokenExpiredSignal?.delete(req.params.id);
     }
 
-    res.json({ success: true });
+    res.json({ success: true, waitedMs });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/** 批量刷新 Token（仅支持 bin/url 来源，受全局 authUserLimiter 限流） */
+router.post("/batch-refresh-tokens", async (req, res) => {
+  try {
+    const { ids } = req.body || {};
+    if (!Array.isArray(ids) || ids.length === 0) {
+      return res.status(400).json({ error: "请提供账号ID列表" });
+    }
+
+    // 取出当前用户的所有账号，只处理 ids 里的
+    const allAccounts = db.getAllAccounts(req.userKey);
+    const targetAccounts = allAccounts.filter(a => ids.includes(a.id));
+    if (targetAccounts.length === 0) {
+      return res.status(404).json({ error: "未找到匹配的账号" });
+    }
+
+    const results = { success: [], failed: [], skipped: [] };
+
+    for (const account of targetAccounts) {
+      try {
+        // 只支持 bin 和 url 来源，manual 来源跳过
+        if (account.import_method !== "bin" && account.import_method !== "url") {
+          results.skipped.push({ id: account.id, name: account.name, reason: "不支持的导入方式" });
+          continue;
+        }
+
+        let jsonToken, wsUrl;
+        if (account.import_method === "url" && account.source_url) {
+          const response = await axios.get(account.source_url, { timeout: 10000 });
+          if (response.data?.token) {
+            jsonToken = response.data.token;
+          } else if (typeof response.data === "string" && response.data.length > 20) {
+            jsonToken = response.data;
+          } else {
+            results.failed.push({ id: account.id, name: account.name, error: "URL 返回数据格式无效" });
+            continue;
+          }
+          wsUrl = buildWsUrl(jsonToken);
+        } else if (account.bin_base64) {
+          // BIN 形式：重新调用 authuser（受 authUserLimiter 全局限流）
+          const binBuf = Buffer.from(account.bin_base64, "base64");
+          const binArrayBuffer = binBuf.buffer.slice(binBuf.byteOffset, binBuf.byteOffset + binBuf.byteLength);
+          jsonToken = await transformToken(binArrayBuffer);
+          wsUrl = buildWsUrl(jsonToken);
+        } else {
+          results.skipped.push({ id: account.id, name: account.name, reason: "无 BIN 数据或 sourceUrl" });
+          continue;
+        }
+
+        db.updateAccount(account.id, { token: jsonToken, ws_url: wsUrl }, req.userKey);
+
+        // 清理旧的会话恢复缓存
+        if (poolRef) {
+          poolRef._lastSuccessfulToken?.delete(account.id);
+          poolRef._lastRecvSeq?.delete(account.id);
+          poolRef._tokenExpiredSignal?.delete(account.id);
+        }
+
+        results.success.push({ id: account.id, name: account.name });
+      } catch (error) {
+        results.failed.push({ id: account.id, name: account.name, error: error.message });
+      }
+    }
+
+    res.json({
+      success: true,
+      summary: {
+        total: targetAccounts.length,
+        success: results.success.length,
+        failed: results.failed.length,
+        skipped: results.skipped.length,
+      },
+      results,
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

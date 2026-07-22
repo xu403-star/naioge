@@ -127,6 +127,10 @@ function findAnswer(question) {
 
 // ======== 默认设置 ========
 // 所有任务都有独立开关，前端勾选后才会执行
+// 注意：仅修改 defaultSettings 中的默认值是不够的——
+// 数据库历史设置和前端传入的 customSettings 会覆盖默认值。
+// 若要把某功能从每日任务"强制关闭/开启"，必须改下方 FORCED_SETTINGS，
+// 它会在 loadSettings 和 run 两处自动覆盖历史设置与 customSettings。
 const defaultSettings = {
   // 阵容配置
   arenaFormation: 1,
@@ -151,7 +155,8 @@ const defaultSettings = {
   genieSweepEnable: true,
   blackMarketPurchase: true,
   dungeonEnable: true,
-  studyEnable: true,
+  // 答题已从每日任务默认模板中剔除（保留代码与开关，用户可手动开启）
+  studyEnable: false,
   // 车辆任务已从每日模板移除（仅在开放日通过批量/独立入口执行）
   smartSendCarEnable: false,
   claimCarsEnable: false,
@@ -163,6 +168,17 @@ const defaultSettings = {
   // 通用延迟
   commandDelay: 500,
   taskDelay: 500,
+};
+
+// ======== 每日任务强制设置（单一数据源） ========
+// 无论数据库历史设置还是前端传入的 customSettings，这些字段始终以代码为准。
+// 以后要把某项功能从每日任务强制关闭/开启，只需改这里一处，loadSettings 和 run 自动生效。
+const FORCED_SETTINGS = {
+  // 车辆任务已从每日模板移除（仅在开放日通过批量/独立入口执行）
+  smartSendCarEnable: false,
+  claimCarsEnable: false,
+  // 答题已从每日任务默认模板剔除（保留代码与开关，用户可手动开启）
+  studyEnable: false,
 };
 
 // ======== 已知的可忽略错误码（合并自 xyzw_web_helper） ========
@@ -182,7 +198,7 @@ const SKIP_ERROR_CODES = {
   1000020: "今天已经领取过奖励了",
   1400010: "没有购买该月卡",
   4100040: "通行证未购买/未开启",
-  400340: "服务器限流",
+  // 400340（服务器限流）已移出可忽略列表：限流是临时状态，改为在 executeGameCommand 内等待重试，避免直接跳过影响后续奖励
   12000116: "今日已领取免费奖励",
   2300250: "俱乐部BOSS今日攻打次数已用完",
   2300370: "俱乐部商品购买数量超出上限",
@@ -210,9 +226,8 @@ export class TaskRunner {
 
   log(message, type = "info") {
     if (this.callbacks.onLog) {
-      const nameTag = this.currentAccountName ? `[${this.currentAccountName}]` : "";
-      const prefix = nameTag ? `${nameTag} ` : "";
-      this.callbacks.onLog({ time: new Date().toLocaleTimeString(), message: prefix + message, type });
+      // 账号名前缀由上层（scheduler.accountLog / BatchEngine）统一添加，这里只输出纯消息
+      this.callbacks.onLog({ time: new Date().toLocaleTimeString(), message, type });
     }
   }
 
@@ -220,24 +235,39 @@ export class TaskRunner {
    * 执行游戏命令（增强版：优雅处理已知可忽略错误）
    */
   async executeGameCommand(accountId, cmd, params = {}, description = "", timeout = 8000) {
-    try {
-      if (description) this.log(`${description}...`);
-      const result = await this.pool.sendMessage(accountId, cmd, params, timeout);
-      if (description) this.log(`${description} - 成功`, "success");
-      return result;
-    } catch (error) {
-      // 检查是否为已知可忽略的错误码
-      const errMsg = error.message || "";
-      for (const [code, desc] of Object.entries(SKIP_ERROR_CODES)) {
-        if (errMsg.includes(code) || errMsg.includes(desc)) {
-          if (description) this.log(`${description} - 跳过 (${desc})`, "warning");
-          return { skipped: true, code, message: desc };
+    // 400340 服务器限流：等待后重试1次（限流是临时状态，不应直接跳过影响后续奖励）
+    const MAX_ATTEMPTS = 2;
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      try {
+        if (description) this.log(`${description}...`);
+        const result = await this.pool.sendMessage(accountId, cmd, params, timeout);
+        if (description) this.log(`${description} - 成功`, "success");
+        // 命令成功后应用通用命令延迟（commandDelay），让全局延迟作用于所有走此方法的命令
+        const cmdDelay = this.settings?.commandDelay;
+        if (cmdDelay && cmdDelay > 0) {
+          await new Promise(r => setTimeout(r, cmdDelay));
         }
+        return result;
+      } catch (error) {
+        const errMsg = error.message || "";
+        // 400340 服务器限流：等待2秒后重试一次（仅首次）
+        if (/400340/.test(errMsg) && attempt === 0) {
+          if (description) this.log(`${description} - 服务器限流，等待后重试...`, "warning");
+          await new Promise(r => setTimeout(r, 2000));
+          continue;
+        }
+        // 检查是否为已知可忽略的错误码
+        for (const [code, desc] of Object.entries(SKIP_ERROR_CODES)) {
+          if (errMsg.includes(code) || errMsg.includes(desc)) {
+            if (description) this.log(`${description} - 跳过 (${desc})`, "warning");
+            return { skipped: true, code, message: desc };
+          }
+        }
+        if (description) {
+          this.log(`${description} - 失败: ${error.message}`, "error");
+        }
+        throw error;
       }
-      if (description) {
-        this.log(`${description} - 失败: ${error.message}`, "error");
-      }
-      throw error;
     }
   }
 
@@ -277,16 +307,13 @@ export class TaskRunner {
    */
   loadSettings(accountId) {
     const account = db.getAccount(accountId);
-    if (!account) return { ...defaultSettings };
+    if (!account) return { ...defaultSettings, ...FORCED_SETTINGS };
     try {
       const custom = JSON.parse(account.settings || "{}");
-      const merged = { ...defaultSettings, ...custom };
-      // 车辆任务已从每日模板移除：无论历史设置如何，每日任务中不再执行
-      merged.smartSendCarEnable = false;
-      merged.claimCarsEnable = false;
-      return merged;
+      // 合并顺序：默认值 → 历史设置 → 强制设置（强制设置始终胜出）
+      return { ...defaultSettings, ...custom, ...FORCED_SETTINGS };
     } catch {
-      return { ...defaultSettings };
+      return { ...defaultSettings, ...FORCED_SETTINGS };
     }
   }
 
@@ -349,10 +376,12 @@ export class TaskRunner {
   async run(accountId, callbacks = {}, customSettings = null) {
     this.callbacks = callbacks;
     let settings = customSettings || this.loadSettings(accountId);
-    // 车辆任务已从每日模板移除：前端传入的历史设置也强制关闭
+    // 应用强制设置：覆盖前端传入的 customSettings，确保 FORCED_SETTINGS 始终胜出
     if (settings && typeof settings === "object") {
-      settings = { ...settings, smartSendCarEnable: false, claimCarsEnable: false };
+      settings = { ...settings, ...FORCED_SETTINGS };
     }
+    // 暴露给实例方法（如 executeGameCommand）使用通用延迟 commandDelay
+    this.settings = settings;
     const account = db.getAccount(accountId);
     const accountName = account?.role_name || account?.name || accountId;
 
@@ -371,6 +400,8 @@ export class TaskRunner {
 
     // 新任务开始前清除可能残留的手动中止标记，避免上一次的断开操作影响本次任务
     this.pool.clearAbort(accountId);
+    // 恢复该账号的自动连接权限，确保任务执行期间断线可以自动重连（后续手动断开会重新关闭）
+    this.pool.allowAutoConnect(accountId, true);
 
     // 申请任务槽位：任务执行期间占用并发名额，断线不释放
     await this.pool.acquireTaskSlot(accountId);
@@ -921,8 +952,8 @@ export class TaskRunner {
 
       // 执行前检查连接状态，断线则自动重连
       if (this.pool.getStatus(accountId) !== "connected") {
-        // 重连前再次检查是否被手动中止，避免用户断开后又自动连上
-        if (this.pool.isAborted(accountId)) {
+        // 重连前再次检查是否被手动中止或禁止自动连接，避免用户断开后又自动连上
+        if (this.pool.isAborted(accountId) || !this.pool.isAutoConnectAllowed(accountId)) {
           this.log("手动断开状态下不再重连，停止执行任务", "warning");
           break;
         }
@@ -959,8 +990,8 @@ export class TaskRunner {
 
           // 第一次失败且是连接/Token 类错误，尝试刷新 token 重连并重做当前任务
           if (attempt === 0 && isConnectionError(errMsg)) {
-            // 如果已被手动中止，不再重连
-            if (this.pool.isAborted(accountId)) {
+            // 如果已被手动中止或禁止自动连接，不再重连
+            if (this.pool.isAborted(accountId) || !this.pool.isAutoConnectAllowed(accountId)) {
               this.log(`${task.name} - 手动断开状态下不再重连`, "warning");
               break;
             }

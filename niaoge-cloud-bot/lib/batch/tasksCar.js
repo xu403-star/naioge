@@ -3,6 +3,7 @@
  * 从 xyzw (2) tasksCar.js + carUtils.js 移植并适配 ConnectionPool
  */
 import * as db from "../db.js";
+import { makeLog, makeExec } from "./logHelper.js";
 import {
   normalizeCars,
   gradeLabel,
@@ -13,6 +14,7 @@ import {
   ITEM_RESEARCH_PIECE,
   CAR_RESEARCH_COST,
 } from "./carUtils.js";
+import { recordCarSendLog, formatSendSummary } from "./carLog.js";
 
 /** 获取当前日期字符串（按每天 1:00 作为跨天边界） */
 function getSnapshotDay() {
@@ -34,35 +36,6 @@ function saveCarSnapshot(accountId, status) {
 export class CarTasks {
   constructor(pool) {
     this.pool = pool;
-    this.callbacks = {};
-  }
-
-  log(msg, type = "info") {
-    if (typeof this.callbacks === "function") {
-      this.callbacks({
-        time: new Date().toLocaleTimeString(),
-        message: msg,
-        type,
-      });
-      return;
-    }
-    if (this.callbacks && typeof this.callbacks.onLog === "function") {
-      this.callbacks.onLog({
-        time: new Date().toLocaleTimeString(),
-        message: msg,
-        type,
-      });
-    }
-  }
-
-  async exec(accountId, cmd, params = {}, desc = "", timeout = 10000) {
-    try {
-      if (desc) this.log(`${desc}...`);
-      return await this.pool.sendMessage(accountId, cmd, params, timeout);
-    } catch (e) {
-      if (desc) this.log(`${desc} - 失败: ${e.message}`, "error");
-      throw e;
-    }
   }
 
   /**
@@ -86,26 +59,37 @@ export class CarTasks {
    * 获取刷新券数量
    * 失败时保守返回 2（对齐 xyzw (2) 行为），避免网络抖动导致提前停止刷新
    */
-  async getRefreshTickets(accountId, conservativeOnError = true) {
-    try {
-      const role = await this.getRoleInfo(accountId);
-      return Number(role?.items?.[35002]?.quantity || 0);
-    } catch {
-      if (conservativeOnError) {
-        this.log(`获取刷新券数量失败，保守视为2`, "warning");
-        return 2;
+  async getRefreshTickets(accountId, log, conservativeOnError = true) {
+    let lastError = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const role = await this.getRoleInfo(accountId);
+        if (!role || typeof role !== "object" || !role.items || typeof role.items !== "object") {
+          throw new Error("角色信息解析失败");
+        }
+        const item = role.items[35002];
+        if (!item || item.quantity === undefined || item.quantity === null) {
+          throw new Error("刷新券数量缺失");
+        }
+        return Number(item.quantity || 0);
+      } catch (e) {
+        lastError = e;
+        if (attempt < 2) await new Promise((r) => setTimeout(r, 300));
       }
-      return 0;
     }
+    if (conservativeOnError) {
+      log(`获取刷新券数量失败(${lastError?.message || "unknown"})，保守视为2`, "warning");
+      return 2;
+    }
+    return 0;
   }
 
   /**
    * 获取俱乐部成员（护卫列表）
    */
-  async getHelpers(accountId, currentRoleId) {
+  async getHelpers(accountId, currentRoleId, exec) {
     try {
-      const res = await this.exec(
-        accountId,
+      const res = await exec(
         "legion_getinfo",
         {},
         "获取俱乐部信息",
@@ -146,12 +130,12 @@ export class CarTasks {
   /**
    * 为红色及以上车辆分配护卫
    */
-  async assignHelper(accountId, car, helpers, usageMap) {
+  async assignHelper(accountId, car, helpers, usageMap, log) {
     const color = Number(car.color || 0);
     if (color < 5 || car.helperId) return;
 
     if (!helpers.length) {
-      this.log(`车辆[${gradeLabel(color)}]需要护卫，但无可用护卫`, "warning");
+      log(`车辆[${gradeLabel(color)}]需要护卫，但无可用护卫`, "warning");
       return;
     }
 
@@ -163,12 +147,12 @@ export class CarTasks {
     if (best) {
       car.helperId = best.id;
       usageMap[best.id] = Number(usageMap[best.id] || 0) + 1;
-      this.log(
+      log(
         `车辆[${gradeLabel(color)}]分配护卫: ${best.name} (${usageMap[best.id]}/4)`,
         "success"
       );
     } else {
-      this.log(
+      log(
         `车辆[${gradeLabel(color)}]需要护卫，但所有护卫次数已满`,
         "warning"
       );
@@ -186,24 +170,9 @@ export class CarTasks {
    * @param {object} options.delay - 延迟配置 { action, refresh }（毫秒）
    * @param {object} callbacks - 回调 { onLog }
    */
-  async smartSend(accountId, options = {}, callbacks = {}) {
-    this.callbacks = callbacks;
-    const acc = db.getAccount(accountId);
-    const name = acc?.name || accountId;
-
-    // 局部日志函数，避免并发时 this.callbacks 被覆盖导致日志串号
-    const log = (msg, type = "info") => {
-      const entry = {
-        time: new Date().toLocaleTimeString(),
-        message: msg,
-        type,
-      };
-      if (typeof callbacks === "function") {
-        callbacks(entry);
-      } else if (callbacks && typeof callbacks.onLog === "function") {
-        callbacks.onLog(entry);
-      }
-    };
+  async smartSend(accountId, options = {}, callbacks = {}, userKey = null) {
+    const log = makeLog(callbacks);
+    const exec = makeExec(this.pool, accountId, log);
 
     const thresholds = {
       gold: Number(options.thresholds?.gold ?? DEFAULT_CAR_THRESHOLDS.gold),
@@ -219,21 +188,20 @@ export class CarTasks {
     const delayAction = Number(options.delay?.action ?? options.actionDelay ?? 300);
     const delayRefresh = Number(options.delay?.refresh ?? options.refreshDelay ?? 1000);
 
-    log(`[${name}] === 智能发车 ===`);
+    log(`=== 智能发车 ===`);
     await this.pool.ensureConnected(accountId);
 
     try {
       // 0. 发车前先尝试收车，避免昨天未收的车占用车位导致统计错误
       try {
-        log(`[${name}] 智能发车前尝试一键收车...`);
+        log(`智能发车前尝试一键收车...`);
         await this.claimAll(accountId, callbacks);
       } catch (e) {
-        log(`[${name}] 发车前收车失败: ${e.message}，继续发车`, "warning");
+        log(`发车前收车失败: ${e.message}，继续发车`, "warning");
       }
 
       // 1. 获取车辆列表
-      const carRes = await this.exec(
-        accountId,
+      const carRes = await exec(
         "car_getrolecar",
         {},
         "获取车辆信息"
@@ -241,8 +209,8 @@ export class CarTasks {
       const carList = normalizeCars(carRes?.body || carRes);
 
       // 2. 获取刷新券
-      let refreshTickets = await this.getRefreshTickets(accountId);
-      log(`[${name}] 刷新券: ${refreshTickets}`);
+      let refreshTickets = await this.getRefreshTickets(accountId, log);
+      log(`刷新券: ${refreshTickets}`);
 
       // 3. 获取当前角色 ID 与护卫列表
       let helpers = [];
@@ -250,15 +218,24 @@ export class CarTasks {
       if (assignHelperEnabled) {
         const role = await this.getRoleInfo(accountId);
         const currentRoleId = role.roleId ? String(role.roleId) : null;
-        helpers = await this.getHelpers(accountId, currentRoleId);
+        helpers = await this.getHelpers(accountId, currentRoleId, exec);
         helperUsage = await this.getHelperUsage(accountId);
 
         if (helpers.length) {
-          log(`[${name}] 获取到 ${helpers.length} 位潜在护卫`);
+          log(`获取到 ${helpers.length} 位潜在护卫`);
         }
       }
 
       let sentCount = 0;
+      const sentCars = []; // 发车详情收集，用于汇总日志与持久化
+      const pushSentCar = (car) => {
+        sentCars.push({
+          carId: car.id,
+          color: car.color,
+          rewards: Array.isArray(car.rewards) ? car.rewards : [],
+        });
+      };
+
       for (const car of carList) {
         if (Number(car.sendAt || 0) !== 0) continue; // 已发车
 
@@ -266,17 +243,18 @@ export class CarTasks {
           // 检查是否满足保底条件
           if (shouldSendCarSimple(car, thresholds)) {
             const stopResult = checkStopCondition(car.rewards, thresholds);
-            if (assignHelperEnabled) await this.assignHelper(accountId, car, helpers, helperUsage);
+            if (assignHelperEnabled) await this.assignHelper(accountId, car, helpers, helperUsage, log);
             log(
               `车辆[${gradeLabel(car.color)}]满足保底条件(${stopResult.reason})，直接发车`
             );
-            await this.exec(accountId, "car_send", {
+            await exec("car_send", {
               carId: String(car.id),
               helperId: car.helperId ? String(car.helperId) : 0,
               text: "",
               isUpgrade: false,
             });
             sentCount++;
+            pushSentCar(car);
             await new Promise((r) => setTimeout(r, delayAction));
             continue;
           }
@@ -288,18 +266,19 @@ export class CarTasks {
           else if (refreshTickets > 0) shouldRefresh = true;
 
           if (!shouldRefresh) {
-            if (assignHelperEnabled) await this.assignHelper(accountId, car, helpers, helperUsage);
+            if (assignHelperEnabled) await this.assignHelper(accountId, car, helpers, helperUsage, log);
             log(
               `车辆[${gradeLabel(car.color)}]没有免费刷新次数且刷新券不足，直接发车`,
               "warning"
             );
-            await this.exec(accountId, "car_send", {
+            await exec("car_send", {
               carId: String(car.id),
               helperId: car.helperId ? String(car.helperId) : 0,
               text: "",
               isUpgrade: false,
             });
             sentCount++;
+            pushSentCar(car);
             await new Promise((r) => setTimeout(r, delayAction));
             continue;
           }
@@ -307,8 +286,7 @@ export class CarTasks {
           // 刷新循环
           while (shouldRefresh && Number(car.sendAt || 0) === 0) {
             log(`车辆[${gradeLabel(car.color)}]尝试刷新(保底模式)...`);
-            const resp = await this.exec(
-              accountId,
+            const resp = await exec(
               "car_refresh",
               { carId: String(car.id) },
               "刷新车辆",
@@ -323,23 +301,25 @@ export class CarTasks {
               if (data.rewards != null) car.rewards = data.rewards;
             }
 
-            refreshTickets = await this.getRefreshTickets(accountId);
+            refreshTickets = await this.getRefreshTickets(accountId, log);
+            log(`刷新后刷新券: ${refreshTickets}`);
 
             // 刷新后检查保底条件
             if (shouldSendCarSimple(car, thresholds)) {
               const stopResult = checkStopCondition(car.rewards, thresholds);
-              if (assignHelperEnabled) await this.assignHelper(accountId, car, helpers, helperUsage);
+              if (assignHelperEnabled) await this.assignHelper(accountId, car, helpers, helperUsage, log);
               log(
                 `刷新后车辆[${gradeLabel(car.color)}]满足保底条件(${stopResult.reason})，发车`,
                 "success"
               );
-              await this.exec(accountId, "car_send", {
+              await exec("car_send", {
                 carId: String(car.id),
                 helperId: car.helperId ? String(car.helperId) : 0,
                 text: "",
                 isUpgrade: false,
               });
               sentCount++;
+              pushSentCar(car);
               await new Promise((r) => setTimeout(r, delayAction));
               break;
             }
@@ -349,18 +329,27 @@ export class CarTasks {
             if (freeNow) shouldRefresh = true;
             else if (refreshTickets > 0) shouldRefresh = true;
             else {
-              if (assignHelperEnabled) await this.assignHelper(accountId, car, helpers, helperUsage);
+              // 如果判断为不足，再做一次保守确认，避免 transient 0 导致误判
+              const retryTickets = await this.getRefreshTickets(accountId, log);
+              if (retryTickets > 0) {
+                log(`刷新券不足判断疑似异常，重试后: ${retryTickets}，继续刷新`, "warning");
+                refreshTickets = retryTickets;
+                shouldRefresh = true;
+                continue;
+              }
+              if (assignHelperEnabled) await this.assignHelper(accountId, car, helpers, helperUsage, log);
               log(
                 `车辆[${gradeLabel(car.color)}]没有免费刷新次数且刷新券不足，保底未满足直接发车`,
                 "warning"
               );
-              await this.exec(accountId, "car_send", {
+              await exec("car_send", {
                 carId: String(car.id),
                 helperId: car.helperId ? String(car.helperId) : 0,
                 text: "",
                 isUpgrade: false,
               });
               sentCount++;
+              pushSentCar(car);
               await new Promise((r) => setTimeout(r, delayAction));
               break;
             }
@@ -377,9 +366,24 @@ export class CarTasks {
         await this.getStatus(accountId);
       } catch {}
 
-      log(`[${name}] 智能发车完成，共发 ${sentCount} 辆`, "success");
+      // 输出汇总日志（账号名：发车数量4 | 赛车1:红(500金砖) | 赛车2:橙(3招募令) | ...）
+      // userKey 可能为 null（定时任务等场景），此时 db.getAccount 第二参数用 null 兜底
+      const accInfo = userKey
+        ? db.getAccount(accountId, userKey)
+        : (db.getAccount(accountId) || db.getAllAccounts().find(a => a.id === accountId));
+      const accountName = accInfo?.name || accountId;
+      // 奖励只显示达到保底阈值的资源项（金砖/刷新券/招募令/白玉）
+      const summary = formatSendSummary(sentCount, sentCars, thresholds);
+      log(`${accountName}：${summary}`, sentCount > 0 ? "success" : "info");
+
+      // 持久化到 car-log 文件（按 userKey 隔离，同样只记录达标奖励）
+      if (userKey) {
+        recordCarSendLog(accountId, accountName, sentCount, sentCars, userKey, thresholds);
+      }
+
+      log(`智能发车完成，共发 ${sentCount} 辆`, "success");
     } catch (e) {
-      log(`[${name}] 智能发车失败: ${e.message}`, "error");
+      log(`智能发车失败: ${e.message}`, "error");
     }
   }
 
@@ -425,30 +429,14 @@ export class CarTasks {
 
   /** 一键收车 + 自动改装升级 */
   async claimAll(accountId, callbacks = {}) {
-    this.callbacks = callbacks;
-    const acc = db.getAccount(accountId);
-    const name = acc?.name || accountId;
+    const log = makeLog(callbacks);
+    const exec = makeExec(this.pool, accountId, log);
 
-    // 局部日志函数，避免并发时 this.callbacks 被覆盖导致日志串号
-    const log = (msg, type = "info") => {
-      const entry = {
-        time: new Date().toLocaleTimeString(),
-        message: msg,
-        type,
-      };
-      if (typeof callbacks === "function") {
-        callbacks(entry);
-      } else if (callbacks && typeof callbacks.onLog === "function") {
-        callbacks.onLog(entry);
-      }
-    };
-
-    log(`[${name}] === 一键收车 ===`);
+    log(`=== 一键收车 ===`);
     await this.pool.ensureConnected(accountId);
 
     try {
-      const carRes = await this.exec(
-        accountId,
+      const carRes = await exec(
         "car_getrolecar",
         {},
         "获取车辆信息"
@@ -461,8 +449,7 @@ export class CarTasks {
         if (!canClaim(car)) continue;
 
         try {
-          await this.exec(
-            accountId,
+          await exec(
             "car_claim",
             { carId: String(car.id) },
             `收车[${gradeLabel(car.color)}]`
@@ -480,8 +467,7 @@ export class CarTasks {
             pieces >= CAR_RESEARCH_COST[refreshLevel]
           ) {
             try {
-              await this.exec(
-                accountId,
+              await exec(
                 "car_research",
                 { researchId: 1 },
                 `车辆改装升级 Lv${refreshLevel + 1}`,
@@ -516,10 +502,10 @@ export class CarTasks {
       }
 
       if (claimed === 0)
-        log(`[${name}] 没有可收取的车辆`, "info");
-      else log(`[${name}] 收车完成，共收取 ${claimed} 辆`, "success");
+        log(`没有可收取的车辆`, "info");
+      else log(`收车完成，共收取 ${claimed} 辆`, "success");
     } catch (e) {
-      log(`[${name}] 收车失败: ${e.message}`, "error");
+      log(`收车失败: ${e.message}`, "error");
     }
   }
 }

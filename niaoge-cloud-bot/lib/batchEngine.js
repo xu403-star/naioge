@@ -95,6 +95,12 @@ export class BatchEngine {
       this._emitStatus(run, accountId, "running");
 
       try {
+        // 任务开始时恢复该账号的自动连接权限并清除中止标记
+        if (this.pool) {
+          this.pool.allowAutoConnect(accountId, true);
+          this.pool.clearAbort(accountId);
+        }
+
         // 申请任务槽位，确保任务执行期间占用并发名额
         if (this.pool) {
           await this.pool.acquireTaskSlot(accountId).catch(() => {});
@@ -109,15 +115,20 @@ export class BatchEngine {
           }
         }
 
-        const account = db.getAccount(accountId, run.userKey);
-        const name = account?.name || accountId;
+        // 使用连接中缓存的真实角色名，未连接时回退到数据库显示名
+        const name = this.pool
+          ? this.pool.getRoleName(accountId)
+          : (db.getAccount(accountId, run.userKey)?.name || accountId);
         this._emitLog(run, accountId, `[${name}] 开始执行 ${this._getLabel(run.operation)}`, "info");
 
         const logCb = (entry) => {
-          const message = entry.message?.startsWith(`[${name}]`)
-            ? entry.message
-            : `[${name}] ${entry.message}`;
-          this._emitLog(run, accountId, message, entry.type || "info");
+          // 模块内部可能残留旧的 [name] 前缀，统一去掉后由本引擎加，确保格式一致且不重复
+          let message = entry.message || "";
+          const prefix = `[${name}]`;
+          if (message.startsWith(prefix)) {
+            message = message.slice(prefix.length).trimStart();
+          }
+          this._emitLog(run, accountId, `${prefix} ${message}`, entry.type || "info");
         };
 
         await executeBatchOperation(this.modules, run.operation, accountId, run.body, logCb, run.userKey);
@@ -127,7 +138,7 @@ export class BatchEngine {
       } catch (error) {
         run.status.set(accountId, "failed");
         this._emitStatus(run, accountId, "failed");
-        this._emitLog(run, accountId, `执行失败: ${error.message}`, "error");
+        this._emitLog(run, accountId, `[${name}] 执行失败: ${error.message}`, "error");
       } finally {
         executing.delete(accountId);
         // 释放任务槽位，自动断开连接
@@ -276,7 +287,7 @@ export async function executeBatchOperation(modules, operation, accountId, body 
         },
         assignHelper: s.assignHelper ?? true,
         delay: s.delay || { action: s.actionDelay ?? 300, refresh: s.refreshDelay ?? 1000 },
-      }, logCb);
+      }, logCb, userKey);
     case "claimCars": return m.car.claimAll(accountId, logCb);
     case "blackMarket": return m.store.storeQuickPurchase(accountId, logCb, { force: s.force });
     case "treasurePavilion": return m.store.claimCollectionFree(accountId, logCb);

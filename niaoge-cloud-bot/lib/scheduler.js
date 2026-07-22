@@ -18,6 +18,24 @@ async function runWithConcurrency(items, limit, fn) {
 }
 
 /**
+ * 统一任务项格式：支持旧字符串格式和新对象格式
+ * - "daily" -> { key: "daily", config: {} }
+ * - { op: "smartSendCar", thresholds: {...} } -> { key: "smartSendCar", config: { thresholds: {...} } }
+ */
+function normalizeTask(t) {
+  if (typeof t === "string") return { key: t, config: {} };
+  if (t && typeof t === "object" && !Array.isArray(t)) {
+    const key = t.op || t.key;
+    if (!key || typeof key !== "string") return null;
+    const config = { ...t };
+    delete config.op;
+    delete config.key;
+    return { key, config };
+  }
+  return null;
+}
+
+/**
  * 把 HH:mm 固定时间转成 node-cron 表达式（每天）
  */
 function fixedTimeToCron(fixedTime) {
@@ -34,6 +52,7 @@ export class Scheduler {
     this.taskRunner = taskRunner;
     this.options = options;
     this.taskHandlers = options.taskHandlers || {};
+    this.batchRunner = options.batchRunner || null;
     this.defaultMaxActive = options.maxActive || 2;
     this.jobs = new Map(); // scheduleId -> cronJob
     this.running = new Map(); // scheduleId -> Promise
@@ -42,6 +61,7 @@ export class Scheduler {
   }
 
   setLogCallback(fn) { this.onLog = fn; }
+  setBatchRunner(fn) { this.batchRunner = fn; }
 
   log(msg, level = "info") {
     if (this.onLog) this.onLog({ time: new Date().toISOString(), message: msg, level });
@@ -128,17 +148,23 @@ export class Scheduler {
     });
 
     this.jobs.set(id, job);
-    this.log(`[${name}] 已注册: ${cronExpr} → ${accountIds.length} 个账号，并发 ${maxActive}`);
+    this.log(`[${name}] 已注册: ${cronExpr} → ${accountIds.length} 个账号，并发 ${maxActive}，账号列表: ${accountIds.join(",")}`);
   }
 
   /**
    * 执行一次调度任务
    */
   async _executeSchedule(id, name, tasks, accountIds, maxActive) {
-    this.log(`[${name}] 触发定时任务 (${accountIds.length} 个账号，并发 ${maxActive})`);
+    this.log(`[${name}] 触发定时任务 (${accountIds.length} 个账号，并发 ${maxActive})，实际执行: ${accountIds.join(",")}`);
+
+    const normalizedTasks = tasks.map(normalizeTask).filter(Boolean);
+    if (normalizedTasks.length === 0) {
+      this.log(`[${name}] 任务列表为空或格式无效，跳过`, "warning");
+      return;
+    }
 
     // 如果包含每日任务，提前刷新 Token（最佳努力）
-    if (tasks.includes("daily")) {
+    if (normalizedTasks.some((t) => t.key === "daily")) {
       try {
         await this.taskRunner.preRefreshTokens(accountIds, {
           onLog: (entry) => this.log(`[${name}] ${entry.message}`, entry.type || "info"),
@@ -155,25 +181,57 @@ export class Scheduler {
         return;
       }
 
+      const accountName = account?.name || accountId;
       const accountLog = (msg, level = "info") => {
-        this.log(`[${name}] [${account.name}] ${msg}`, level);
+        // 消息由 handler / batchRunner 自行带上账号角色名前缀；这里只加任务名前缀
+        this.log(`[${name}] ${msg}`, level);
       };
 
+      // 每次定时任务开始时恢复该账号的自动连接权限并清除上次的手动中止标记
+      this.pool.allowAutoConnect(accountId, true);
+      this.pool.clearAbort(accountId);
+
+      let wasAborted = false;
       try {
-        for (const task of tasks) {
-          const handler = this.taskHandlers[task];
-          if (!handler) {
-            accountLog(`未知任务: ${task}`, "warning");
-            continue;
+        for (const task of normalizedTasks) {
+          // 手动断开后中止后续任务执行
+          if (this.pool.isAborted(accountId)) {
+            wasAborted = true;
+            accountLog(`${accountName} 已被手动中止，跳过剩余任务`);
+            break;
           }
-          accountLog(`开始执行: ${task}`);
-          await handler(accountId, accountLog);
+          const { key, config } = task;
+          const handler = this.taskHandlers[key];
+          if (handler) {
+            accountLog(`${accountName} 开始执行: ${key}`);
+            await handler(accountId, accountLog);
+          } else if (this.batchRunner) {
+            accountLog(`${accountName} 开始执行: ${key}`);
+            await this.batchRunner(key, accountId, accountLog, config);
+          } else {
+            accountLog(`${accountName} 未知任务: ${key}`, "warning");
+          }
         }
-        db.addLog(accountId, account.name, name, "success", "任务完成");
-        this.log(`[${name}] ${account.name}: 全部完成`, "success");
+        if (wasAborted) {
+          db.addLog(accountId, accountName, name, "warning", "任务被手动中止");
+          this.log(`[${name}] ${accountName}: 已手动中止`, "warning");
+        } else {
+          db.addLog(accountId, accountName, name, "success", "任务完成");
+          this.log(`[${name}] ${accountName}: 全部完成`, "success");
+        }
       } catch (error) {
-        this.log(`[${name}] ${account.name}: 执行失败 - ${error.message}`, "error");
-        db.addLog(accountId, account.name, name, "error", error.message);
+        this.log(`[${name}] ${accountName}: 执行失败 - ${error.message}`, "error");
+        db.addLog(accountId, accountName, name, "error", error.message);
+      } finally {
+        // 任务执行完毕后主动释放连接，避免占用连接槽并停止前端轮询
+        try {
+          await this.pool.disconnect(accountId);
+          accountLog(`${accountName} 已断开连接`);
+        } catch (disconnectError) {
+          accountLog(`${accountName} 断开连接失败: ${disconnectError.message}`, "warning");
+        }
+        // 任务执行完毕后清除手动中止标记，确保下次定时任务可正常连接
+        this.pool.clearAbort(accountId);
       }
     });
 

@@ -12,7 +12,7 @@ process.on("unhandledRejection", (reason) => {
 
 import express from "express";
 import cors from "cors";
-import { existsSync, readFileSync, writeFileSync, readdirSync } from "fs";
+import { existsSync, readFileSync, writeFileSync, readdirSync, mkdirSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import fileUpload from "express-fileupload";
@@ -27,7 +27,9 @@ import tasksRouter, { setScheduler as setTasksScheduler } from "./api/tasks.js";
 import portalRouter from "./api/portal.js";
 import * as portalDb from "./lib/portalDb.js";
 import { authMiddleware, login, logout, getSession, createUser, listUsers, deleteUser, verifyToken } from "./lib/auth.js";
+import { setGlobalDelay, getGlobalDelay } from "./lib/globalDelay.js";
 import { getDreamShopLogPath, DREAM_SHOP_LOG_DIR } from "./lib/batch/tasksDungeon.js";
+import { getCarLogPath, CAR_LOG_DIR } from "./lib/batch/carLog.js";
 
 // 批量模块
 import { ClubTasks } from "./lib/batch/tasksClub.js";
@@ -63,21 +65,28 @@ const scheduler = new Scheduler(pool, taskRunner, {
   taskHandlers: {
     daily: async (accountId, log) => {
       const account = db.getAccount(accountId);
+      const accountName = account?.name || accountId;
       await taskRunner.run(accountId, {
         onLog: (entry) => {
-          log(entry.message, entry.type || "info");
-          db.addLog(accountId, account?.name || accountId, "daily", entry.message, entry.type || "info", account?.user_key);
+          log(`[${accountName}] ${entry.message}`, entry.type || "info");
+          db.addLog(accountId, accountName, "daily", entry.message, entry.type || "info", account?.user_key);
         },
         onProgress: () => {},
-      });
+      }, withGlobalDelay(null));
     },
     connect: async (accountId, log) => {
+      const account = db.getAccount(accountId);
+      const accountName = account?.name || accountId;
+      pool.allowAutoConnect(accountId, true);
+      pool.clearAbort(accountId);
       await pool.ensureConnected(accountId);
-      log("已连接");
+      log(`[${accountName}] 已连接`);
     },
     disconnect: async (accountId, log) => {
+      const account = db.getAccount(accountId);
+      const accountName = account?.name || accountId;
       await pool.disconnect(accountId);
-      log("已断开");
+      log(`[${accountName}] 已断开`);
     },
   },
 });
@@ -100,6 +109,24 @@ const batchModules = {
 
 // 统一批量任务引擎（labelMap 在文件下方定义）
 const batchEngine = new BatchEngine(batchModules, { maxConcurrency: 2, pool });
+
+// 让定时任务调度器可以执行任意批量操作
+scheduler.setBatchRunner(async (operation, accountId, log, config = {}) => {
+  await pool.acquireTaskSlot(accountId);
+  try {
+    await pool.ensureConnected(accountId);
+    const accountName = pool.getRoleName(accountId);
+    await executeBatchOperation(
+      batchModules,
+      operation,
+      accountId,
+      config,
+      (entry) => log(`[${accountName}] ${entry.message}`, entry.type || "info"),
+    );
+  } finally {
+    await pool.releaseTaskSlot(accountId);
+  }
+});
 
 // 定时清理已完成的运行记录，防止内存泄漏
 setInterval(() => batchEngine.cleanup(), 10 * 60 * 1000);
@@ -352,6 +379,15 @@ const DEFAULT_BATCH_SETTINGS = {
   maxLogEntries: 1000,
 };
 
+/**
+ * 把全局延迟（来自 Accounts 页面"通用延迟"）注入到每日任务 customSettings。
+ * 确保全局延迟对每日任务（手动/定时/批量）统一生效，覆盖账号设置的默认 500ms。
+ */
+function withGlobalDelay(customSettings) {
+  const g = getGlobalDelay();
+  return { ...(customSettings || {}), commandDelay: g.commandDelay, taskDelay: g.taskDelay };
+}
+
 app.get("/api/settings/batch", (req, res) => {
   const saved = db.getUserSetting(req.userKey, 'batchSettings');
   res.json({ ...DEFAULT_BATCH_SETTINGS, ...(saved || {}) });
@@ -361,6 +397,8 @@ app.put("/api/settings/batch", (req, res) => {
   try {
     const merged = { ...DEFAULT_BATCH_SETTINGS, ...req.body };
     db.setUserSetting(req.userKey, 'batchSettings', merged);
+    // 同步到全局延迟，让每日任务和批量任务统一生效
+    setGlobalDelay({ commandDelay: merged.commandDelay, taskDelay: merged.taskDelay });
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -379,6 +417,10 @@ app.post("/api/control/connect/:id", async (req, res) => {
   try {
     const account = db.getAccount(req.params.id, req.userKey);
     if (!account) return res.status(404).json({ error: "账号不存在" });
+
+    // 手动连接时恢复该账号的自动连接权限并清除中止标记
+    pool.allowAutoConnect(req.params.id, true);
+    pool.clearAbort(req.params.id);
 
     await pool.ensureConnected(req.params.id);
     res.json({ success: true });
@@ -422,20 +464,21 @@ app.post("/api/control/run-daily/:id", async (req, res) => {
 
     // 异步执行，支持前端传递任务设置
     const customSettings = req.body?.settings || null;
+    const accountName = account.role_name || account.name;
     try {
       await new TaskRunner(pool).run(req.params.id, {
         onLog: (entry) => {
-          addLog({ ...entry, accountId: req.params.id });
+          addLog({ ...entry, accountId: req.params.id, message: `[${accountName}] ${entry.message}` });
           db.addLog(req.params.id, account.name, "手动每日任务", entry.message, entry.type || "info", req.userKey);
         },
         onDailyPointUpdate: (accountId, point, max) => {
           // 活跃度变化时通过全局日志通道实时通知前端
           addLog({ accountId, message: `__DAILY_POINT_UPDATE__:${point}/${max}`, type: "info" });
         },
-      }, customSettings);
-      addLog({ message: `[${account.role_name || account.name}] 手动每日任务完成`, level: "success" });
+      }, withGlobalDelay(customSettings));
+      addLog({ message: `[${accountName}] 手动每日任务完成`, level: "success" });
     } catch (error) {
-      addLog({ message: `[${account.role_name || account.name}] 手动每日任务失败: ${error.message}`, level: "error" });
+      addLog({ message: `[${accountName}] 手动每日任务失败: ${error.message}`, level: "error" });
     }
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -606,6 +649,249 @@ app.post("/api/logs/dream-shop/clear", (req, res) => {
   }
 });
 
+/** 导出当前用户梦境日志 JSON（用于导入还原） */
+app.get("/api/logs/dream-shop/export-json", (req, res) => {
+  try {
+    const records = readDreamShopRecords(req.userKey);
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="dream-shop-log-${req.userKey}-${Date.now()}.json"`);
+    res.json(records);
+  } catch (e) {
+    console.error("[dream-shop-log] 导出JSON失败:", e.message);
+    res.status(500).json({ error: "导出失败" });
+  }
+});
+
+/** 导入梦境日志 JSON（合并到当前用户，自动过滤超过 7 天的记录） */
+app.post("/api/logs/dream-shop/import", (req, res) => {
+  try {
+    const incoming = Array.isArray(req.body) ? req.body : req.body?.records;
+    if (!Array.isArray(incoming)) return res.status(400).json({ error: "JSON 格式错误：需要数组或 {records:[]} 结构" });
+    const logPath = getDreamShopLogPath(req.userKey);
+    let existing = [];
+    if (existsSync(logPath)) {
+      try { existing = JSON.parse(readFileSync(logPath, "utf8")) || []; } catch { existing = []; }
+    }
+    const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
+    // 用 time+accountName+merchantName+itemName 做去重 key
+    const seen = new Set(existing.map(r => `${r.time}|${r.accountName}|${r.merchantName}|${r.itemName}`));
+    let added = 0;
+    for (const r of incoming) {
+      if (!r?.time || new Date(r.time).getTime() <= cutoff) continue;
+      const key = `${r.time}|${r.accountName}|${r.merchantName}|${r.itemName}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      existing.push(r);
+      added++;
+    }
+    existing.sort((a, b) => new Date(a.time).getTime() - new Date(b.time).getTime());
+    if (!existsSync(dirname(logPath))) mkdirSync(dirname(logPath), { recursive: true });
+    writeFileSync(logPath, JSON.stringify(existing, null, 2), "utf8");
+    res.json({ success: true, added, total: existing.length });
+  } catch (e) {
+    console.error("[dream-shop-log] 导入失败:", e.message);
+    res.status(500).json({ error: "导入失败" });
+  }
+});
+
+// ======== 赛车发车日志 API（仿照 dream-shop-log） ========
+
+/** 读取赛车发车日志（按当前登录用户隔离，7 天保留） */
+function readCarRecords(userKey) {
+  const logPath = getCarLogPath(userKey);
+  if (!existsSync(logPath)) return [];
+  try {
+    const raw = readFileSync(logPath, "utf8");
+    const records = JSON.parse(raw);
+    if (!Array.isArray(records)) return [];
+    const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
+    return records
+      .filter(r => r?.time && new Date(r.time).getTime() > cutoff)
+      .sort((a, b) => new Date(b.time).getTime() - new Date(a.time).getTime());
+  } catch (e) {
+    console.error("[car-log] 读取失败:", e.message);
+    return [];
+  }
+}
+
+function filterCarRecords(records, { from, to, accountId }) {
+  let filtered = records;
+  if (from) {
+    const fromTime = new Date(from).getTime();
+    filtered = filtered.filter(r => new Date(r.time).getTime() >= fromTime);
+  }
+  if (to) {
+    const toTime = new Date(to).getTime() + 24 * 60 * 60 * 1000 - 1;
+    filtered = filtered.filter(r => new Date(r.time).getTime() <= toTime);
+  }
+  if (accountId) {
+    filtered = filtered.filter(r => r.accountId === accountId);
+  }
+  return filtered;
+}
+
+/** 获取当前用户的赛车发车日志 */
+app.get("/api/logs/car", (req, res) => {
+  try {
+    const { from, to, accountId } = req.query;
+    const records = readCarRecords(req.userKey);
+    const filtered = filterCarRecords(records, { from, to, accountId });
+    res.json(filtered);
+  } catch (e) {
+    console.error("[car-log] 读取失败:", e.message);
+    res.status(500).json({ error: "读取日志失败" });
+  }
+});
+
+/** 管理员：获取所有用户的赛车发车日志 */
+app.get("/api/logs/car/all", (req, res) => {
+  try {
+    const admin = verifyToken(req.headers.authorization?.slice(7));
+    if (!admin || admin.userKey !== 'admin') return res.status(403).json({ error: "无权限" });
+    const { from, to, accountId } = req.query;
+    const allRecords = [];
+    if (existsSync(CAR_LOG_DIR)) {
+      const files = readdirSync(CAR_LOG_DIR).filter(f => f.startsWith("car-log.") && f.endsWith(".json"));
+      for (const file of files) {
+        const userKey = file.slice("car-log.".length, -".json".length);
+        const records = readCarRecords(userKey).map(r => ({ ...r, userKey }));
+        allRecords.push(...records);
+      }
+    }
+    const filtered = filterCarRecords(allRecords, { from, to, accountId });
+    res.json(filtered);
+  } catch (e) {
+    console.error("[car-log] 读取全部失败:", e.message);
+    res.status(500).json({ error: "读取日志失败" });
+  }
+});
+
+/** 清空当前用户的赛车发车日志 */
+app.post("/api/logs/car/clear", (req, res) => {
+  try {
+    const logPath = getCarLogPath(req.userKey);
+    if (existsSync(logPath)) {
+      writeFileSync(logPath, JSON.stringify([], null, 2), "utf8");
+    }
+    res.json({ success: true });
+  } catch (e) {
+    console.error("[car-log] 清空失败:", e.message);
+    res.status(500).json({ error: "清空日志失败" });
+  }
+});
+
+/** 导出当前用户赛车日志 JSON（用于导入还原） */
+app.get("/api/logs/car/export-json", (req, res) => {
+  try {
+    const records = readCarRecords(req.userKey);
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="car-log-${req.userKey}-${Date.now()}.json"`);
+    res.json(records);
+  } catch (e) {
+    console.error("[car-log] 导出JSON失败:", e.message);
+    res.status(500).json({ error: "导出失败" });
+  }
+});
+
+/** 赛车日志转 CSV 表格（每个发车记录一行，含车辆明细和达标奖励） */
+function carRecordsToCSV(records, includeUserKey = false) {
+  const headers = includeUserKey
+    ? ["时间", "用户", "账号", "发车数量", "车辆明细", "达标奖励汇总"]
+    : ["时间", "账号", "发车数量", "车辆明细", "达标奖励汇总"];
+  const rows = records.map(r => {
+    const carsDetail = (r.cars || []).map((c, i) =>
+      `赛车${i + 1}:${c.colorLabel || "未知"}`
+    ).join(" | ");
+    const rewardsSummary = (r.cars || [])
+      .flatMap(c => c.rewards || [])
+      .reduce((acc, cur) => {
+        acc[cur.name] = (acc[cur.name] || 0) + (cur.count || 0);
+        return acc;
+      }, {});
+    const rewardsStr = Object.entries(rewardsSummary)
+      .map(([name, count]) => `${count}${name}`)
+      .join(",") || "无达标奖励";
+    const base = [new Date(r.time).toLocaleString(), r.accountName, r.sentCount, carsDetail, rewardsStr];
+    if (includeUserKey) base.splice(1, 0, r.userKey);
+    return base.map(escapeCSV).join(",");
+  });
+  return [headers.join(","), ...rows].join("\n");
+}
+
+/** 导出当前用户赛车日志 CSV 表格 */
+app.get("/api/logs/car/export", (req, res) => {
+  try {
+    const { from, to, accountId } = req.query;
+    const records = readCarRecords(req.userKey);
+    const filtered = filterCarRecords(records, { from, to, accountId });
+    const csv = carRecordsToCSV(filtered);
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="car-log-${req.userKey}.csv"`);
+    res.send("\uFEFF" + csv);
+  } catch (e) {
+    console.error("[car-log] 导出CSV失败:", e.message);
+    res.status(500).json({ error: "导出失败" });
+  }
+});
+
+/** 管理员：导出所有用户赛车日志 CSV 表格 */
+app.get("/api/logs/car/all/export", (req, res) => {
+  try {
+    const admin = verifyToken(req.headers.authorization?.slice(7));
+    if (!admin || admin.userKey !== 'admin') return res.status(403).json({ error: "无权限" });
+    const { from, to, accountId } = req.query;
+    const allRecords = [];
+    if (existsSync(CAR_LOG_DIR)) {
+      const files = readdirSync(CAR_LOG_DIR).filter(f => f.startsWith("car-log.") && f.endsWith(".json"));
+      for (const file of files) {
+        const userKey = file.slice("car-log.".length, -".json".length);
+        const records = readCarRecords(userKey).map(r => ({ ...r, userKey }));
+        allRecords.push(...records);
+      }
+    }
+    const filtered = filterCarRecords(allRecords, { from, to, accountId });
+    const csv = carRecordsToCSV(filtered, true);
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="car-log-all.csv"`);
+    res.send("\uFEFF" + csv);
+  } catch (e) {
+    console.error("[car-log] 导出全部CSV失败:", e.message);
+    res.status(500).json({ error: "导出失败" });
+  }
+});
+
+/** 导入赛车日志 JSON（合并到当前用户，自动过滤超过 7 天的记录） */
+app.post("/api/logs/car/import", (req, res) => {
+  try {
+    const incoming = Array.isArray(req.body) ? req.body : req.body?.records;
+    if (!Array.isArray(incoming)) return res.status(400).json({ error: "JSON 格式错误：需要数组或 {records:[]} 结构" });
+    const logPath = getCarLogPath(req.userKey);
+    let existing = [];
+    if (existsSync(logPath)) {
+      try { existing = JSON.parse(readFileSync(logPath, "utf8")) || []; } catch { existing = []; }
+    }
+    const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
+    // 用 time+accountId+sentCount 做去重 key
+    const seen = new Set(existing.map(r => `${r.time}|${r.accountId}|${r.sentCount}`));
+    let added = 0;
+    for (const r of incoming) {
+      if (!r?.time || new Date(r.time).getTime() <= cutoff) continue;
+      const key = `${r.time}|${r.accountId}|${r.sentCount}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      existing.push(r);
+      added++;
+    }
+    existing.sort((a, b) => new Date(a.time).getTime() - new Date(b.time).getTime());
+    if (!existsSync(dirname(logPath))) mkdirSync(dirname(logPath), { recursive: true });
+    writeFileSync(logPath, JSON.stringify(existing, null, 2), "utf8");
+    res.json({ success: true, added, total: existing.length });
+  } catch (e) {
+    console.error("[car-log] 导入失败:", e.message);
+    res.status(500).json({ error: "导入失败" });
+  }
+});
+
 /** 获取定时任务状态 */
 app.get("/api/control/schedules", (req, res) => {
   res.json(scheduler.getActiveSchedules());
@@ -721,16 +1007,17 @@ app.post("/api/control/run-daily-batch", async (req, res) => {
   addLog({ message: `批量每日任务(选中): ${accounts.length} 个账号`, level: "info" });
 
   for (const account of accounts) {
+    const accountName = account.role_name || account.name;
     try {
       await taskRunner.run(account.id, {
         onLog: (entry) => {
-          addLog({ ...entry, accountId: account.id });
+          addLog({ ...entry, accountId: account.id, message: `[${accountName}] ${entry.message}` });
           db.addLog(account.id, account.name, "批量每日任务", entry.message, entry.type || "info", req.userKey);
         },
-      }, settings || null);
-      addLog({ message: `[${account.name}] 每日任务完成`, level: "success" });
+      }, withGlobalDelay(settings || null));
+      addLog({ message: `[${accountName}] 每日任务完成`, level: "success" });
     } catch (error) {
-      addLog({ message: `[${account.name}] 每日任务失败: ${error.message}`, level: "error" });
+      addLog({ message: `[${accountName}] 每日任务失败: ${error.message}`, level: "error" });
       db.addLog(account.id, account.name, "批量每日任务", "error", error.message, req.userKey);
     }
     await new Promise(r => setTimeout(r, 3000));
@@ -753,16 +1040,17 @@ app.post("/api/control/run-daily-all", async (req, res) => {
   addLog({ message: `批量每日任务: ${connected.length} 个账号`, level: "info" });
 
   for (const account of connected) {
+    const accountName = account.role_name || account.name;
     try {
       await taskRunner.run(account.id, {
         onLog: (entry) => {
-          addLog({ ...entry, accountId: account.id });
+          addLog({ ...entry, accountId: account.id, message: `[${accountName}] ${entry.message}` });
           db.addLog(account.id, account.name, "批量每日任务", entry.message, entry.type || "info", req.userKey);
         },
-      }, customSettings);
-      addLog({ message: `[${account.name}] 每日任务完成`, level: "success" });
+      }, withGlobalDelay(customSettings));
+      addLog({ message: `[${accountName}] 每日任务完成`, level: "success" });
     } catch (error) {
-      addLog({ message: `[${account.name}] 每日任务失败: ${error.message}`, level: "error" });
+      addLog({ message: `[${accountName}] 每日任务失败: ${error.message}`, level: "error" });
       db.addLog(account.id, account.name, "批量每日任务", "error", error.message, req.userKey);
     }
     await new Promise(r => setTimeout(r, 3000));
@@ -871,6 +1159,8 @@ app.post("/api/batch/run-all/:operation", async (req, res) => {
       ids = db.getAllAccounts(req.userKey).map(a => a.id);
     }
 
+    console.log(`[批量操作] ${req.params.operation} 收到账号列表:`, ids);
+
     if (!ids.length) return res.status(400).json({ error: "没有可用的账号" });
 
     const runId = batchEngine.createRun(req.params.operation, ids, req.body || {}, {
@@ -975,9 +1265,7 @@ async function requireConnected(id, userKey) {
   if (!account) throw Object.assign(new Error("账号不存在"), { status: 404 });
   const status = pool.getStatus(id);
   if (status !== "connected") {
-    // 尝试自动连接
-    try { await pool.ensureConnected(id); }
-    catch (e) { throw Object.assign(new Error("账号未连接"), { status: 400 }); }
+    throw Object.assign(new Error("账号未连接"), { status: 400 });
   }
   return account;
 }
@@ -1343,6 +1631,12 @@ async function start() {
 
   // Portal卡密表初始化（依赖db初始化完毕）
   portalDb.initPortalDB();
+
+  // 加载已保存的全局延迟设置，同步到 globalDelay 模块
+  const savedBatch = db.getUserSetting('admin', 'batchSettings');
+  if (savedBatch) {
+    setGlobalDelay({ commandDelay: savedBatch.commandDelay, taskDelay: savedBatch.taskDelay });
+  }
 
   app.listen(PORT, () => {
     // 在启动完成后再注入 labelMap，避免变量提升问题

@@ -488,8 +488,7 @@ function addLog(message, type = 'info') {
 .status-dot.offline { background: var(--text-muted, #999); }
 
 .tab-bar {
-  display: flex; gap: 4px; padding: 8px 0; overflow-x: auto;
-  -webkit-overflow-scrolling: touch;
+  display: flex; flex-wrap: wrap; gap: 4px; padding: 8px 0;
 }
 .tab-btn {
   flex-shrink: 0; padding: 6px 14px; border-radius: 20px;

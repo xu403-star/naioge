@@ -10,13 +10,25 @@ export function setScheduler(s) { schedulerRef = s; }
 
 const router = Router();
 
-// type → taskList 映射
+// type → taskList 映射（兼容旧客户端，新格式统一走 taskList 数组）
 const TYPE_MAP = {
-  "daily-all": ["daily"],
-  "connect-all": ["connect"],
-  "disconnect-all": ["disconnect"],
-  "daily-then-disconnect": ["daily", "disconnect"],
+  "daily-all": [{ op: "daily" }],
+  "connect-all": [{ op: "connect" }],
+  "disconnect-all": [{ op: "disconnect" }],
+  "daily-then-disconnect": [{ op: "daily" }, { op: "disconnect" }],
 };
+
+/**
+ * 把旧字符串 taskList 归一化为新对象格式，确保兼容性
+ * ["daily"] => [{ op: "daily" }]
+ */
+function normalizeTaskList(list) {
+  if (!Array.isArray(list)) return list;
+  return list.map((t) => {
+    if (typeof t === "string") return { op: t };
+    return t;
+  });
+}
 
 /**
  * 把 HH:mm 固定时间转成 5 字段 cron 表达式
@@ -65,14 +77,14 @@ router.post("/", (req, res) => {
     }
 
     // type → taskList 转换
-    const tasks = taskList || TYPE_MAP[type] || ["daily"];
+    const tasks = taskList || TYPE_MAP[type] || [{ op: "daily" }];
 
     const result = db.addSchedule({
       name,
       scheduleType: sType,
       fixedTime: fixedTime || "",
       cronExpression: cronExpr,
-      taskList: tasks,
+      taskList: normalizeTaskList(tasks),
       accountIds: accountIds || "*",
       maxActive: Number(maxActive) || 2,
       enabled: enabled ?? 1,
@@ -104,6 +116,11 @@ router.put("/:id", (req, res) => {
       } catch (e) {
         return res.status(400).json({ error: e.message });
       }
+    }
+
+    // 归一化 taskList 中的字符串项为对象格式
+    if (body.taskList && Array.isArray(body.taskList)) {
+      body.taskList = normalizeTaskList(body.taskList);
     }
 
     db.updateSchedule(id, body, req.userKey);

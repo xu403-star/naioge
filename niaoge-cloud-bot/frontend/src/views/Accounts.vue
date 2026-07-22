@@ -1,5 +1,13 @@
 <template>
   <div class="dashboard-page">
+    <!-- 定时任务管理条 -->
+    <ScheduleManager
+      :accounts="accounts"
+      :batch-settings="batchSettings"
+      @update:count="scheduleCount = $event"
+      @refresh="loadStats"
+    />
+
     <!-- 顶部统计 -->
     <div class="stats-bar">
       <div class="stat-card">
@@ -85,6 +93,9 @@
                 <button class="btn btn-xs btn-outline" @click="openAccountSettings(acc)" title="账号设置">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="12" height="12"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
                 </button>
+                <button class="btn btn-xs btn-outline" style="color:var(--danger)" @click="deleteAccount(acc)" title="删除账号">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="12" height="12"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+                </button>
               </div>
             </div>
           </div>
@@ -99,6 +110,8 @@
             <div class="panel-actions" v-if="hasSelection">
               <button class="btn btn-outline btn-sm" @click="batchConnect">连接</button>
               <button class="btn btn-outline btn-sm" @click="batchDisconnect">断开</button>
+              <button class="btn btn-outline btn-sm" @click="batchRefreshTokens" :disabled="refreshingTokens">刷新Token</button>
+              <button class="btn btn-outline btn-sm" style="color:var(--danger)" @click="batchDelete">删除</button>
               <button class="btn btn-primary btn-sm" @click="batchDaily">每日</button>
               <button v-if="running" class="btn btn-danger btn-sm" @click="abortBatch">停止</button>
             </div>
@@ -130,12 +143,111 @@
         <div v-if="logs.length > 0" class="panel log-panel">
           <div class="panel-header">
             <h2>执行日志</h2>
-            <button class="btn btn-xs btn-outline" @click="clearLogs">清空</button>
+            <div class="panel-actions">
+              <label class="auto-scroll-toggle">
+                <input type="checkbox" v-model="autoScrollLog" />
+                <span>自动滚动</span>
+              </label>
+              <button class="btn btn-xs btn-outline" @click="openDreamShopModal">梦境日志</button>
+              <button class="btn btn-xs btn-outline" @click="openCarLogModal">赛车日志</button>
+              <button class="btn btn-xs btn-outline" @click="clearLogs">清空</button>
+            </div>
           </div>
           <div class="log-list" ref="logListRef">
             <div v-for="(log, i) in logs" :key="i" class="log-line" :class="log.type">
               <span class="log-time">{{ log.time }}</span>
               <span class="log-message">{{ log.message }}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 梦境购买日志弹窗 -->
+    <div v-if="showDreamShopModal" class="modal-overlay" @click.self="closeDreamShopModal">
+      <div class="modal-card log-modal">
+        <div class="modal-header">
+          <div style="font-weight:700;font-size:16px">梦境购买日志</div>
+          <div class="modal-header-actions">
+            <button class="btn btn-xs btn-outline" @click="loadDreamShopLogs">刷新</button>
+            <button class="btn btn-xs btn-outline" @click="exportDreamShopJson" :disabled="dreamShopAllUsers">导出JSON</button>
+            <button class="btn btn-xs btn-outline" @click="exportDreamShopCsv" :disabled="dreamShopAllUsers">导出CSV</button>
+            <label class="btn btn-xs btn-outline" style="margin:0;cursor:pointer">
+              导入
+              <input type="file" accept=".json" style="display:none" @change="importDreamShopJson" />
+            </label>
+            <label v-if="isAdmin" class="admin-toggle-inline">
+              <input v-model="dreamShopAllUsers" type="checkbox" /> 全部用户
+            </label>
+            <button class="btn btn-xs btn-outline" @click="closeDreamShopModal">关闭</button>
+          </div>
+        </div>
+        <div class="modal-body">
+          <div v-if="dreamShopLoading" class="text-center text-muted" style="padding:30px">加载中...</div>
+          <div v-else-if="dreamShopLogs.length === 0" class="text-center text-muted" style="padding:30px">暂无梦境购买记录</div>
+          <div v-else>
+            <div v-for="(group, date) in dreamShopGrouped" :key="date" style="margin-bottom:12px">
+              <div style="font-size:12px;color:var(--text-muted);margin-bottom:6px;padding-left:4px">{{ date }}</div>
+              <div v-for="(log, i) in group" :key="i" class="log-modal-card">
+                <div class="log-modal-time">
+                  {{ formatTime(log.time) }}
+                  <span v-if="dreamShopAllUsers" class="user-tag">{{ log.userKey }}</span>
+                </div>
+                <div class="log-modal-msg">
+                  <span style="font-weight:600">{{ log.accountName }}</span>
+                  <span style="color:var(--text-muted)"> · </span>
+                  <span>{{ log.merchantName }}</span>
+                  <span style="color:var(--text-muted)"> · </span>
+                  <span style="color:var(--success);font-weight:500">{{ log.itemName }}</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 赛车发车日志弹窗 -->
+    <div v-if="showCarLogModal" class="modal-overlay" @click.self="closeCarLogModal">
+      <div class="modal-card log-modal">
+        <div class="modal-header">
+          <div style="font-weight:700;font-size:16px">赛车发车日志</div>
+          <div class="modal-header-actions">
+            <button class="btn btn-xs btn-outline" @click="loadCarLogs">刷新</button>
+            <button class="btn btn-xs btn-outline" @click="exportCarLogJson" :disabled="carLogAllUsers">导出JSON</button>
+            <button class="btn btn-xs btn-outline" @click="exportCarLogCsv" :disabled="carLogAllUsers">导出CSV</button>
+            <label class="btn btn-xs btn-outline" style="margin:0;cursor:pointer">
+              导入
+              <input type="file" accept=".json" style="display:none" @change="importCarLogJson" />
+            </label>
+            <label v-if="isAdmin" class="admin-toggle-inline">
+              <input v-model="carLogAllUsers" type="checkbox" /> 全部用户
+            </label>
+            <button class="btn btn-xs btn-outline" @click="closeCarLogModal">关闭</button>
+          </div>
+        </div>
+        <div class="modal-body">
+          <div v-if="carLogLoading" class="text-center text-muted" style="padding:30px">加载中...</div>
+          <div v-else-if="carLogs.length === 0" class="text-center text-muted" style="padding:30px">暂无赛车发车记录</div>
+          <div v-else>
+            <div v-for="(group, date) in carLogGrouped" :key="date" style="margin-bottom:12px">
+              <div style="font-size:12px;color:var(--text-muted);margin-bottom:6px;padding-left:4px">{{ date }}</div>
+              <div v-for="(log, i) in group" :key="i" class="log-modal-card car">
+                <div class="log-modal-time">
+                  {{ formatTime(log.time) }}
+                  <span v-if="carLogAllUsers" class="user-tag">{{ log.userKey }}</span>
+                </div>
+                <div class="log-modal-msg">
+                  <span style="font-weight:600">{{ log.accountName }}</span>
+                  <span style="color:var(--text-muted)"> · </span>
+                  <span style="color:var(--primary)">发车 {{ log.sentCount }} 辆</span>
+                </div>
+                <div v-if="log.cars && log.cars.length" class="log-modal-cars">
+                  <span v-for="(c, idx) in log.cars" :key="idx" class="car-chip" :class="'car-color-' + c.color">
+                    赛车{{ idx + 1 }}:{{ c.colorLabel }}<template v-if="c.rewards && c.rewards.length">（<span v-for="(r, ri) in c.rewards" :key="ri">{{ r.count }}{{ r.name }}<span v-if="ri < c.rewards.length - 1">,</span></span>）</template>
+                  </span>
+                </div>
+              </div>
             </div>
           </div>
         </div>
@@ -460,6 +572,7 @@
 import { ref, computed, reactive, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import { api } from '../api'
 import { useToastStore } from '../stores/toast'
+import ScheduleManager from '../components/ScheduleManager.vue'
 
 const toast = useToastStore()
 const accounts = ref([])
@@ -470,9 +583,11 @@ const running = ref(false)
 const currentRunId = ref(null)
 const runStatus = ref(null)
 const currentOperationLabel = ref('')
+const refreshingTokens = ref(false)
 let statusTimer = null
 const logs = ref([])
 const logListRef = ref(null)
+const autoScrollLog = ref(true)
 let logTimer = null
 
 const accountStatusMap = reactive({})
@@ -487,6 +602,17 @@ const dreamGoldItems = { 1: [5, 6], 2: [6, 7], 3: [5, 6, 7] }
 const dreamStorageKey = 'dreamPurchaseList'
 
 const dreamBuyList = ref([])
+
+// ======== 弹窗日志（梦境购买/赛车发车） ========
+const isAdmin = ref(false)
+const showDreamShopModal = ref(false)
+const dreamShopLogs = ref([])
+const dreamShopLoading = ref(false)
+const dreamShopAllUsers = ref(false)
+const showCarLogModal = ref(false)
+const carLogs = ref([])
+const carLogLoading = ref(false)
+const carLogAllUsers = ref(false)
 
 const DEFAULT_BATCH_SETTINGS = {
   maxActive: 2,
@@ -830,6 +956,7 @@ onMounted(async () => {
   await loadTemplates()
   loadDreamBuyList()
   await loadStats()
+  loadCurrentUser()
   loading.value = false
   startLogPolling()
   refreshAccountStatusForAll()
@@ -969,7 +1096,7 @@ async function fetchServerLogs() {
           logs.value.push({
             time: new Date(isoTime).toLocaleTimeString(),
             isoTime,
-            message: entry.message,
+            message: dedupeLogMessage(entry.message),
             type: entry.level || 'info'
           })
           if (logs.value.length > 200) logs.value.shift()
@@ -1152,6 +1279,287 @@ async function batchDisconnect() {
   await loadAccounts()
 }
 
+// 删除账号（单个，带确认）
+async function deleteAccount(acc) {
+  if (!acc) return
+  if (!confirm(`确定要删除账号「${acc.name || acc.id}」吗？\n此操作不可恢复，会同时清理会话和缓存。`)) return
+  try {
+    await api.del(`/api/accounts/${acc.id}`)
+    addLog(`[${acc.name || acc.id}] 已删除`, 'success')
+    selectedIds.value.delete(acc.id)
+    await loadAccounts()
+  } catch (e) {
+    toast.show('删除失败: ' + e.message)
+  }
+}
+
+// 批量删除（带确认）
+async function batchDelete() {
+  const ids = [...selectedIds.value]
+  if (ids.length === 0) return
+  if (!confirm(`确定要删除选中的 ${ids.length} 个账号吗？\n此操作不可恢复，会同时清理会话和缓存。`)) return
+  addLog(`批量删除 ${ids.length} 个账号`)
+  try {
+    const result = await api.post('/api/accounts/batch-delete', { ids }, { timeout: 60000 })
+    addLog(`批量删除完成：成功 ${result.deletedCount}/${ids.length}`, result.failed?.length ? 'warning' : 'success')
+    if (result.failed?.length) {
+      for (const f of result.failed) {
+        const name = accounts.value.find(a => a.id === f.id)?.name || f.id
+        addLog(`[${name}] 删除失败: ${f.error}`, 'error')
+      }
+    }
+    // 清理已删除账号的选中状态
+    for (const id of result.deleted || []) {
+      selectedIds.value.delete(id)
+    }
+    await loadAccounts()
+  } catch (e) {
+    toast.show('批量删除失败: ' + e.message)
+  }
+}
+
+async function batchRefreshTokens() {
+  const ids = [...selectedIds.value]
+  if (ids.length === 0) return
+  if (refreshingTokens.value) return
+  refreshingTokens.value = true
+  const total = ids.length
+  let success = 0, failed = 0, skipped = 0
+  addLog(`批量刷新 Token ${total} 个账号（受全局限流 25 次/分钟，超 25 个会自动等待）`)
+  for (let i = 0; i < ids.length; i++) {
+    const id = ids[i]
+    const acc = accounts.value.find(a => a.id === id)
+    const name = acc?.name || id
+    addLog(`[${i + 1}/${total}] [${name}] 刷新中...`)
+    try {
+      const resp = await api.post(`/api/accounts/${id}/refresh-token`, null, { timeout: 120000 })
+      success++
+      // 后端返回本次因限流排队等待的毫秒数，>500ms 就明示给用户
+      const waitedMs = resp?.waitedMs || 0
+      if (waitedMs >= 500) {
+        const sec = (waitedMs / 1000).toFixed(1)
+        addLog(`[${i + 1}/${total}] [${name}] 成功（限流等待 ${sec}s）`, 'success')
+      } else {
+        addLog(`[${i + 1}/${total}] [${name}] 成功`, 'success')
+      }
+    } catch (e) {
+      failed++
+      const msg = e.message || ''
+      if (msg.includes('无 BIN') || msg.includes('不支持')) {
+        skipped++
+        addLog(`[${i + 1}/${total}] [${name}] 跳过: ${msg}`, 'warning')
+      } else {
+        addLog(`[${i + 1}/${total}] [${name}] 失败: ${msg}`, 'error')
+      }
+    }
+  }
+  addLog(`刷新完成：成功 ${success}/${total}，失败 ${failed}，跳过 ${skipped}`, failed > 0 ? 'error' : 'success')
+  await loadAccounts()
+  refreshingTokens.value = false
+}
+
+// ======== 弹窗日志：梦境购买 + 赛车发车 ========
+
+function formatDateLabel(iso) {
+  if (!iso) return ''
+  const d = new Date(iso)
+  const now = new Date()
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate())
+  const logDay = new Date(d.getFullYear(), d.getMonth(), d.getDate())
+  const diff = (today - logDay) / (24 * 60 * 60 * 1000)
+  if (diff === 0) return '今天'
+  if (diff === 1) return '昨天'
+  return d.toLocaleDateString()
+}
+
+const dreamShopGrouped = computed(() => {
+  const map = {}
+  for (const log of dreamShopLogs.value) {
+    const date = formatDateLabel(log.time)
+    if (!map[date]) map[date] = []
+    map[date].push(log)
+  }
+  return map
+})
+
+const carLogGrouped = computed(() => {
+  const map = {}
+  for (const log of carLogs.value) {
+    const date = formatDateLabel(log.time)
+    if (!map[date]) map[date] = []
+    map[date].push(log)
+  }
+  return map
+})
+
+async function loadCurrentUser() {
+  try {
+    const me = await api.auth.me()
+    isAdmin.value = me?.userKey === 'admin'
+  } catch {
+    const saved = localStorage.getItem('auth_user')
+    if (saved) {
+      try { isAdmin.value = JSON.parse(saved).userKey === 'admin' } catch {}
+    }
+  }
+}
+
+function openDreamShopModal() {
+  showDreamShopModal.value = true
+  loadDreamShopLogs()
+}
+
+function closeDreamShopModal() {
+  showDreamShopModal.value = false
+}
+
+async function loadDreamShopLogs() {
+  dreamShopLoading.value = true
+  try {
+    const endpoint = dreamShopAllUsers.value ? '/api/logs/dream-shop/all' : '/api/logs/dream-shop'
+    const data = await api.get(endpoint)
+    dreamShopLogs.value = Array.isArray(data) ? data : []
+  } catch (e) {
+    toast.show('加载梦境日志失败: ' + e.message)
+  } finally {
+    dreamShopLoading.value = false
+  }
+}
+
+function openCarLogModal() {
+  showCarLogModal.value = true
+  loadCarLogs()
+}
+
+function closeCarLogModal() {
+  showCarLogModal.value = false
+}
+
+async function loadCarLogs() {
+  carLogLoading.value = true
+  try {
+    const endpoint = carLogAllUsers.value ? '/api/logs/car/all' : '/api/logs/car'
+    const data = await api.get(endpoint)
+    carLogs.value = Array.isArray(data) ? data : []
+  } catch (e) {
+    toast.show('加载赛车日志失败: ' + e.message)
+  } finally {
+    carLogLoading.value = false
+  }
+}
+
+// ======== 日志导入/导出 ========
+// 导出：从浏览器下载当前用户的 JSON 日志文件（保存 7 天内的记录）
+// 导入：上传之前导出的 JSON，后端会合并到当前用户文件并自动过滤超过 7 天的记录
+
+function exportDreamShopJson() {
+  // 用浏览器原生 fetch 拿 blob（api.get 已解析 JSON，这里直接用 token 拼 URL 下载更稳）
+  const token = localStorage.getItem('auth_token') || ''
+  fetch('/api/logs/dream-shop/export-json', {
+    headers: { Authorization: `Bearer ${token}` },
+  })
+    .then(r => r.blob())
+    .then(blob => {
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `dream-shop-log-${Date.now()}.json`
+      a.click()
+      URL.revokeObjectURL(url)
+      toast.show('梦境日志已导出')
+    })
+    .catch(e => toast.show('导出失败: ' + e.message))
+}
+
+function exportCarLogJson() {
+  const token = localStorage.getItem('auth_token') || ''
+  fetch('/api/logs/car/export-json', {
+    headers: { Authorization: `Bearer ${token}` },
+  })
+    .then(r => r.blob())
+    .then(blob => {
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `car-log-${Date.now()}.json`
+      a.click()
+      URL.revokeObjectURL(url)
+      toast.show('赛车日志已导出')
+    })
+    .catch(e => toast.show('导出失败: ' + e.message))
+}
+
+// 通用 CSV 下载（管理员「全部用户」模式走 /all/export，普通用户走 /export）
+function downloadCsv(path, filename, allUsers) {
+  const token = localStorage.getItem('auth_token') || ''
+  const url = allUsers ? path.replace('/export', '/all/export') : path
+  fetch(url, {
+    headers: { Authorization: `Bearer ${token}` },
+  })
+    .then(r => {
+      if (!r.ok) throw new Error('导出失败')
+      return r.blob()
+    })
+    .then(blob => {
+      const objUrl = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = objUrl
+      a.download = filename
+      a.click()
+      URL.revokeObjectURL(objUrl)
+      toast.show('CSV 已导出')
+    })
+    .catch(e => toast.show('导出失败: ' + e.message))
+}
+
+function exportDreamShopCsv() {
+  downloadCsv('/api/logs/dream-shop/export', `dream-shop-log-${Date.now()}.csv`, dreamShopAllUsers.value)
+}
+
+function exportCarLogCsv() {
+  downloadCsv('/api/logs/car/export', `car-log-${Date.now()}.csv`, carLogAllUsers.value)
+}
+
+async function importDreamShopJson(event) {
+  const file = event.target.files?.[0]
+  if (!file) return
+  try {
+    const text = await file.text()
+    const data = JSON.parse(text)
+    const records = Array.isArray(data) ? data : data?.records
+    if (!Array.isArray(records)) throw new Error('文件格式错误：需要 JSON 数组')
+    const result = await api.post('/api/logs/dream-shop/import', records, { timeout: 30000 })
+    toast.show(`梦境日志导入完成：新增 ${result.added} 条，共 ${result.total} 条`)
+    await loadDreamShopLogs()
+  } catch (e) {
+    toast.show('导入失败: ' + (e.message || '未知错误'))
+  } finally {
+    event.target.value = '' // 允许再次选择同一文件
+  }
+}
+
+async function importCarLogJson(event) {
+  const file = event.target.files?.[0]
+  if (!file) return
+  try {
+    const text = await file.text()
+    const data = JSON.parse(text)
+    const records = Array.isArray(data) ? data : data?.records
+    if (!Array.isArray(records)) throw new Error('文件格式错误：需要 JSON 数组')
+    const result = await api.post('/api/logs/car/import', records, { timeout: 30000 })
+    toast.show(`赛车日志导入完成：新增 ${result.added} 条，共 ${result.total} 条`)
+    await loadCarLogs()
+  } catch (e) {
+    toast.show('导入失败: ' + (e.message || '未知错误'))
+  } finally {
+    event.target.value = ''
+  }
+}
+
+// 监听全部用户切换
+watch(dreamShopAllUsers, () => { if (showDreamShopModal.value) loadDreamShopLogs() })
+watch(carLogAllUsers, () => { if (showCarLogModal.value) loadCarLogs() })
+
 async function disconnectAll() {
   const connected = accounts.value.filter(a => a.status === 'connected')
   if (connected.length === 0) return toast.show('当前没有在线账号')
@@ -1252,6 +1660,7 @@ async function runBatch(operation, label, extraBody = {}) {
 
 function startPollingRunStatus() {
   if (statusTimer) clearInterval(statusTimer)
+  const carSnapshotLoaded = new Set()
   statusTimer = setInterval(async () => {
     if (!currentRunId.value) {
       clearInterval(statusTimer)
@@ -1263,6 +1672,10 @@ function startPollingRunStatus() {
       await fetchRunLogs()
       if (status.status) {
         for (const id of Object.keys(status.status)) {
+          if (status.status[id] === 'completed' && !carSnapshotLoaded.has(id)) {
+            carSnapshotLoaded.add(id)
+            await loadAccountCarSnapshot(id)
+          }
           if (['running', 'completed'].includes(status.status[id])) {
             const acc = accounts.value.find(a => a.id === id)
             const fresh = await api.get(`/api/accounts/${id}`).catch(() => null)
@@ -1279,7 +1692,9 @@ function startPollingRunStatus() {
         running.value = false
         await loadAccounts()
         for (const id of Object.keys(status.status || {})) {
-          await loadAccountCarSnapshot(id)
+          if (!carSnapshotLoaded.has(id)) {
+            await loadAccountCarSnapshot(id)
+          }
         }
         addLog(`[${currentOperationLabel.value || '批量任务'}] 全部执行完成`, 'success')
       }
@@ -1302,7 +1717,7 @@ async function fetchRunLogs() {
           logs.value.push({
             time: new Date(isoTime).toLocaleTimeString(),
             isoTime,
-            message: entry.message,
+            message: dedupeLogMessage(entry.message),
             type: entry.type || 'info'
           })
           if (logs.value.length > 200) logs.value.shift()
@@ -1506,15 +1921,24 @@ async function clearLogs() {
   }
 }
 
+function dedupeLogMessage(message) {
+  if (typeof message !== 'string') return message
+  // 去掉连续的重复 [xxx] 前缀，例如 [测试] [账号] [账号] 消息 → [测试] [账号] 消息
+  return message.replace(/(\[[^\]]+\])(\s*\1)+/g, '$1')
+}
+
 function addLog(message, type = 'info') {
-  logs.value.push({ time: new Date().toLocaleTimeString(), message, type })
+  logs.value.push({ time: new Date().toLocaleTimeString(), message: dedupeLogMessage(message), type })
   if (logs.value.length > 200) logs.value.shift()
-  nextTick(() => {
-    if (logListRef.value) logListRef.value.scrollTop = logListRef.value.scrollHeight
-  })
+  if (autoScrollLog.value) {
+    nextTick(() => {
+      if (logListRef.value) logListRef.value.scrollTop = logListRef.value.scrollHeight
+    })
+  }
 }
 
 watch(logs, () => {
+  if (!autoScrollLog.value) return
   nextTick(() => {
     if (logListRef.value) logListRef.value.scrollTop = logListRef.value.scrollHeight
   })
@@ -1535,6 +1959,10 @@ watch(logs, () => {
   margin: 0 auto;
   align-items: start;
 }
+/* grid 子项默认 min-width: auto 会撑爆容器导致横向滚动，强制设为 0 让内容自适应 */
+.dashboard-left, .dashboard-right {
+  min-width: 0;
+}
 .panel {
   background: var(--bg-card, #fff);
   border-radius: 12px;
@@ -1548,6 +1976,8 @@ watch(logs, () => {
   justify-content: space-between;
   padding: 14px 16px;
   border-bottom: 1px solid var(--border, #e5e5e5);
+  gap: 8px;
+  flex-wrap: wrap;
 }
 .panel-header h2 {
   font-size: 16px;
@@ -1557,6 +1987,8 @@ watch(logs, () => {
 .panel-actions {
   display: flex;
   gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 .stats-bar {
   display: grid;
@@ -1746,6 +2178,16 @@ watch(logs, () => {
 .log-line.success { color: var(--success, #52c41a); }
 .log-line.error { color: var(--danger, #ff4d4f); }
 .log-line.info { color: var(--text, #333); }
+.auto-scroll-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--text-secondary, #666);
+  user-select: none;
+}
+.auto-scroll-toggle input { width: 14px; height: 14px; cursor: pointer; }
 .empty-state {
   display: flex;
   flex-direction: column;
@@ -1900,5 +2342,86 @@ watch(logs, () => {
   max-height: 320px;
   overflow-y: auto;
   margin-bottom: 12px;
+}
+
+/* ======== 弹窗日志（梦境/赛车）样式 ======== */
+.log-modal {
+  max-width: 640px;
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+}
+.log-modal .modal-body {
+  overflow-y: auto;
+  padding: 16px;
+  flex: 1;
+}
+.modal-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.admin-toggle-inline {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.log-modal-card {
+  padding: 10px 14px;
+  margin-bottom: 6px;
+  background: var(--bg-card);
+  border-radius: var(--radius-md);
+  border-left: 3px solid var(--success);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  box-shadow: var(--shadow-sm);
+}
+.log-modal-card.car {
+  border-left-color: var(--primary);
+}
+.log-modal-time {
+  font-size: 12px;
+  color: var(--text-muted);
+  font-family: monospace;
+}
+.log-modal-msg {
+  font-size: 13px;
+  color: var(--text-main);
+  word-break: break-all;
+}
+.log-modal-cars {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 4px;
+}
+.car-chip {
+  display: inline-block;
+  padding: 2px 8px;
+  font-size: 12px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-page);
+  color: var(--text-main);
+  border: 1px solid var(--border);
+}
+.car-chip.car-color-5 { color: #e74c3c; border-color: #e74c3c; }
+.car-chip.car-color-6 { color: #f39c12; border-color: #f39c12; font-weight: 600; }
+.car-chip.car-color-4 { color: #e67e22; border-color: #e67e22; }
+.car-chip.car-color-3 { color: #9b59b6; border-color: #9b59b6; }
+.car-chip.car-color-2 { color: #3498db; border-color: #3498db; }
+.car-chip.car-color-1 { color: #27ae60; border-color: #27ae60; }
+.car-chip.car-color-0 { color: var(--text-muted); border-color: var(--text-muted); }
+.user-tag {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 6px;
+  background: var(--primary-soft);
+  color: var(--primary);
+  border-radius: var(--radius-sm);
+  font-size: 11px;
 }
 </style>

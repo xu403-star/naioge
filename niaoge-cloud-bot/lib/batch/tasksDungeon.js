@@ -1,10 +1,11 @@
 /**
  * 副本/宝库/梦境 批处理 - 从 xyzw_web_helper tasksDungeon.js 移植
  */
-import * as db from "../db.js";
+import { makeLog, makeExec } from "./logHelper.js";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
+import * as db from "../db.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 export const DREAM_SHOP_LOG_DIR = join(__dirname, "..", "..", "data", "dream-shop-log");
@@ -74,120 +75,95 @@ function recordDreamShopPurchase(accountId, accountName, mId, itemIdx, userKey) 
 export class DungeonTasks {
   constructor(pool) {
     this.pool = pool;
-    this.callbacks = {};
-  }
-
-  log(msg, type = "info") {
-    const cb = this.callbacks;
-    if (typeof cb === "function") {
-      cb({ time: new Date().toLocaleTimeString(), message: msg, type });
-    } else if (cb?.onLog) {
-      cb.onLog({ time: new Date().toLocaleTimeString(), message: msg, type });
-    }
-  }
-
-  async exec(accountId, cmd, params = {}, desc = "", timeout = 5000) {
-    try {
-      if (desc) this.log(`${desc}...`);
-      const r = await this.pool.sendMessage(accountId, cmd, params, timeout);
-      if (desc) this.log(`${desc} - 成功`, "success");
-      return r;
-    } catch (e) {
-      if (desc) this.log(`${desc} - 失败: ${e.message}`, "error");
-      throw e;
-    }
   }
 
   /** 一键宝库前3层: 获取信息→打2次boss→开9次箱 */
   async baoku13(accountId, callbacks = {}) {
-    this.callbacks = callbacks;
-    const acc = db.getAccount(accountId);
-    const name = acc?.name || accountId;
-    this.log(`[${name}] === 一键宝库前3层 ===`);
+    const log = makeLog(callbacks);
+    const exec = makeExec(this.pool, accountId, log);
+    log(`=== 一键宝库前3层 ===`);
     await this.pool.ensureConnected(accountId);
 
-    const info = await this.exec(accountId, "bosstower_getinfo", {}, "获取宝库信息");
+    const info = await exec("bosstower_getinfo", {}, "获取宝库信息");
     const towerId = info?.bossTower?.towerId;
     if (towerId < 1 || towerId > 3) {
-      this.log(`[${name}] 当前不在1-3层(towerId=${towerId})，跳过`, "warning");
+      log(`当前不在1-3层(towerId=${towerId})，跳过`, "warning");
       return;
     }
 
     for (let i = 0; i < 2; i++) {
-      await this.exec(accountId, "bosstower_startboss", {}, `宝库BOSS ${i + 1}/2`, 8000);
+      await exec("bosstower_startboss", {}, `宝库BOSS ${i + 1}/2`, 8000);
       await new Promise(r => setTimeout(r, 500));
     }
     for (let i = 0; i < 9; i++) {
-      await this.exec(accountId, "bosstower_startbox", {}, `开启宝箱 ${i + 1}/9`);
+      await exec("bosstower_startbox", {}, `开启宝箱 ${i + 1}/9`);
       await new Promise(r => setTimeout(r, 500));
     }
-    this.log(`[${name}] 宝库前3层完成`, "success");
+    log(`宝库前3层完成`, "success");
   }
 
   /** 一键宝库4,5层: 获取信息→打2次boss */
   async baoku45(accountId, callbacks = {}) {
-    this.callbacks = callbacks;
-    const acc = db.getAccount(accountId);
-    const name = acc?.name || accountId;
-    this.log(`[${name}] === 一键宝库4-5层 ===`);
+    const log = makeLog(callbacks);
+    const exec = makeExec(this.pool, accountId, log);
+    log(`=== 一键宝库4-5层 ===`);
     await this.pool.ensureConnected(accountId);
 
-    const info = await this.exec(accountId, "bosstower_getinfo", {}, "获取宝库信息");
+    const info = await exec("bosstower_getinfo", {}, "获取宝库信息");
     const towerId = info?.bossTower?.towerId;
     if (towerId < 4 || towerId > 5) {
-      this.log(`[${name}] 当前不在4-5层(towerId=${towerId})，跳过`, "warning");
+      log(`当前不在4-5层(towerId=${towerId})，跳过`, "warning");
       return;
     }
 
     for (let i = 0; i < 2; i++) {
-      await this.exec(accountId, "bosstower_startboss", {}, `宝库BOSS ${i + 1}/2`, 8000);
+      await exec("bosstower_startboss", {}, `宝库BOSS ${i + 1}/2`, 8000);
       await new Promise(r => setTimeout(r, 500));
     }
-    this.log(`[${name}] 宝库4-5层完成`, "success");
+    log(`宝库4-5层完成`, "success");
   }
 
   /** 一键梦境: 仅周日/一/三/四开放 */
   async mengjing(accountId, callbacks = {}) {
-    this.callbacks = callbacks;
-    const acc = db.getAccount(accountId);
-    const name = acc?.name || accountId;
-    this.log(`[${name}] === 一键梦境 ===`);
+    const log = makeLog(callbacks);
+    const exec = makeExec(this.pool, accountId, log);
+    log(`=== 一键梦境 ===`);
     await this.pool.ensureConnected(accountId);
 
     const dow = new Date().getDay();
     if (dow !== 0 && dow !== 1 && dow !== 3 && dow !== 4) {
-      this.log(`[${name}] 当前非梦境开放日(日/一/三/四)，跳过`, "warning");
+      log(`当前非梦境开放日(日/一/三/四)，跳过`, "warning");
       return;
     }
 
-    const roleInfo = await this.exec(accountId, "role_getroleinfo", {}, "获取梦境信息", 15000);
+    const roleInfo = await exec("role_getroleinfo", {}, "获取梦境信息", 15000);
     const levelId = roleInfo?.role?.levelId || 0;
     const dungeon = roleInfo?.role?.dungeon || {};
     const maxId = dungeon.maxId || 0;
     const dungeonStatus = dungeon.status;
-    this.log(`[${name}] 梦境关卡: ${maxId}`);
+    log(`梦境关卡: ${maxId}`);
 
     if (levelId < 200) {
-      this.log(`[${name}] 关卡数不足(${levelId}<200)，无法进行梦境挑战，跳过`, "warning");
+      log(`关卡数不足(${levelId}<200)，无法进行梦境挑战，跳过`, "warning");
       return;
     }
     if (dungeonStatus === 2 || dungeonStatus === "completed") {
-      this.log(`[${name}] 梦境已完成，无需重复执行`, "warning");
+      log(`梦境已完成，无需重复执行`, "warning");
       return;
     }
 
     const heroId = 107;
     const battleTeam = { 0: heroId };
     try {
-      await this.exec(accountId, "dungeon_selecthero", { battleTeam }, "梦境选将", 10000);
+      await exec("dungeon_selecthero", { battleTeam }, "梦境选将", 10000);
     } catch (e) {
       const msg = e.message || "";
       if (!msg.includes("2600040")) throw e;
-      this.log(`[${name}] 阵容已设置，直接开始战斗`, "info");
+      log(`阵容已设置，直接开始战斗`, "info");
     }
 
     await new Promise(r => setTimeout(r, 500));
-    this.log(`[${name}] 开始梦境战斗...`, "info");
+    log(`开始梦境战斗...`, "info");
 
     let wins = 0, losses = 0, total = 0, consecutiveLosses = 0;
     const maxBattles = 200, maxConsecutiveLosses = 5;
@@ -200,58 +176,63 @@ export class DungeonTasks {
         const dungeonId = res?.dungeonId || res?.stageId || 0;
         if (isWin) { wins++; consecutiveLosses = 0; } else { losses++; consecutiveLosses++; }
         if (!isWin && consecutiveLosses >= maxConsecutiveLosses) {
-          this.log(`[${name}] 连续${consecutiveLosses}次战斗失败，疑似遇到回血武将，停止挑战`, "warning");
+          log(`连续${consecutiveLosses}次战斗失败，疑似遇到回血武将，停止挑战`, "warning");
           break;
         }
         if (dungeonId) {
           await new Promise(r => setTimeout(r, 500));
           try {
-            await this.exec(accountId, "dungeon_reward", { dungeonId }, "领取梦境奖励", 10000);
+            await exec("dungeon_reward", { dungeonId }, "领取梦境奖励", 10000);
           } catch (err) {
-            this.log(`[${name}] 梦境奖励领取失败: ${err.message}`, "warning");
+            log(`梦境奖励领取失败: ${err.message}`, "warning");
           }
         }
         if (total % 10 === 0) {
-          this.log(`[${name}] 梦境进度: 已打${total}场，${wins}胜${losses}负`, "info");
+          log(`梦境进度: 已打${total}场，${wins}胜${losses}负`, "info");
         }
         await new Promise(r => setTimeout(r, 500));
       } catch (e) {
         const msg = e.message || "";
         if (msg.includes("2600080") || msg.includes("2600050") || msg.includes("2600040") || msg.includes("已完成梦境挑战")) {
-          this.log(`[${name}] 梦境挑战结束（武将已阵亡或无剩余次数）`, "info");
+          log(`梦境挑战结束（武将已阵亡或无剩余次数）`, "info");
           break;
         }
-        this.log(`[${name}] 第${total + 1}场战斗出错: ${msg}`, "error");
+        log(`第${total + 1}场战斗出错: ${msg}`, "error");
         break;
       }
     }
 
-    this.log(`[${name}] 咸王梦境完成（${wins}胜${losses}负，共${total}场）`, "success");
+    log(`咸王梦境完成（${wins}胜${losses}负，共${total}场）`, "success");
   }
 
   /** 一键购买梦境商品 */
   async buyDreamItems(accountId, purchaseList, callbacks = {}, userKey = null) {
-    this.callbacks = callbacks;
-    const acc = db.getAccount(accountId, userKey);
-    const name = acc?.name || accountId;
-    this.log(`[${name}] === 梦境购买 ===`);
+    const log = makeLog(callbacks);
+    const exec = makeExec(this.pool, accountId, log);
+    log(`=== 梦境购买 ===`);
     await this.pool.ensureConnected(accountId);
 
     const dow = new Date().getDay();
     if (dow !== 0 && dow !== 1 && dow !== 3 && dow !== 4) {
-      this.log(`[${name}] 当前非梦境开放日，跳过`, "warning");
+      log(`当前非梦境开放日，跳过`, "warning");
       return;
     }
 
-    const roleInfo = await this.exec(accountId, "role_getroleinfo", {}, "获取角色信息", 15000);
+    const roleInfo = await exec("role_getroleinfo", {}, "获取角色信息", 15000);
     const levelId = roleInfo?.role?.levelId || 0;
     if (levelId < 4000) {
-      this.log(`[${name}] 关卡<4000无法购买`, "warning");
+      log(`关卡<4000无法购买`, "warning");
       return;
     }
 
+    // 查询账号显示名（参考 tasksCar.js 的做法），日志里用名字而不是 accountId
+    const accInfo = userKey
+      ? db.getAccount(accountId, userKey)
+      : (db.getAccount(accountId) || db.getAllAccounts().find(a => a.id === accountId));
+    const accountName = accInfo?.name || accountId;
+
     let merchant = roleInfo?.role?.dungeon?.merchant;
-    if (!merchant) { this.log(`[${name}] 无法获取梦境商店`, "error"); return; }
+    if (!merchant) { log(`无法获取梦境商店`, "error"); return; }
 
     let success = 0, fail = 0;
     const summary = new Map(); // merchantName -> Set(itemName)
@@ -269,11 +250,11 @@ export class DungeonTasks {
         for (let p = 0; p < items.length; p++) { if (items[p] === itemIdx) { pos = p; break; } }
         if (pos < 0) break;
         try {
-          await this.exec(accountId, "dungeon_buymerchant", { id: mId, index: itemIdx, pos }, `购买 ${merchantName} 的 ${itemName}`);
+          await exec("dungeon_buymerchant", { id: mId, index: itemIdx, pos }, `购买 ${merchantName} 的 ${itemName}`);
           success++; boughtForThis++;
           if (!summary.has(merchantName)) summary.set(merchantName, new Set());
           summary.get(merchantName).add(itemName);
-          recordDreamShopPurchase(accountId, name, mId, itemIdx, userKey);
+          recordDreamShopPurchase(accountId, accountName, mId, itemIdx, userKey);
         } catch (e) {
           fail++;
           break;
@@ -291,9 +272,9 @@ export class DungeonTasks {
       for (const [merchantName, itemSet] of summary) {
         summaryParts.push(`${merchantName}:${Array.from(itemSet).join("/")}`);
       }
-      this.log(`[${name}] 本次购买: ${summaryParts.join("; ")}`, "info");
+      log(`本次购买: ${summaryParts.join("; ")}`, "info");
     }
-    this.log(`[${name}] 梦境购买: 成功${success}, 失败${fail}`, "success");
+    log(`梦境购买: 成功${success}, 失败${fail}`, "success");
   }
 }
 

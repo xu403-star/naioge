@@ -27,6 +27,8 @@ export class ConnectionPool {
     this._tokenExpiredSignal = new Map(); // accountId -> boolean
     // 手动中止的账号：用户点击断开/断开全部后，正在运行的任务应停止而不是自动重连
     this._manualAborted = new Set();
+    // 用户手动断开后，禁止该账号自动重连，直到下次手动连接或任务重新启动
+    this._autoConnectAllowed = new Map();
     // 会话恢复在部分账号/网络环境下不稳定，默认关闭以优先保证连接成功率
     this.enableSessionRestore = false;
   }
@@ -50,6 +52,26 @@ export class ConnectionPool {
    */
   isAborted(accountId) {
     return this._manualAborted.has(accountId);
+  }
+
+  /**
+   * 设置账号是否允许自动连接。
+   * 用户手动断开/断开全部后设为 false，阻止后续自动重连；
+   * 手动连接或新任务开始时会重新设为 true。
+   */
+  allowAutoConnect(accountId, allowed) {
+    if (allowed) {
+      this._autoConnectAllowed.delete(accountId);
+    } else {
+      this._autoConnectAllowed.set(accountId, false);
+    }
+  }
+
+  /**
+   * 检查账号当前是否允许自动连接
+   */
+  isAutoConnectAllowed(accountId) {
+    return !this._autoConnectAllowed.has(accountId);
   }
 
   setLogCallback(fn) { this.onLog = fn; }
@@ -107,11 +129,21 @@ export class ConnectionPool {
 
   _accountName(accountId) {
     try {
+      // 优先使用连接中缓存的真实角色名，未连接时回退到数据库里的显示名
+      const conn = this.connections.get(accountId);
+      if (conn?.roleName) return conn.roleName;
       const account = db.getAccount(accountId);
       return account?.name || accountId;
     } catch {
       return accountId;
     }
+  }
+
+  /**
+   * 获取账号连接中缓存的真实角色名（游戏内名称）
+   */
+  getRoleName(accountId) {
+    return this._accountName(accountId);
   }
 
   /**
@@ -185,6 +217,9 @@ export class ConnectionPool {
    * 连接一个账号（公开方法，自动加锁）
    */
   async connect(accountId, token, wsUrl, options = {}) {
+    // 手动连接时恢复该账号的自动连接权限
+    this.allowAutoConnect(accountId, true);
+    this.clearAbort(accountId);
     return this._withAccountLock(accountId, () => this._connectLocked(accountId, token, wsUrl, options));
   }
 
@@ -207,6 +242,12 @@ export class ConnectionPool {
     // 抖动，避免同一秒大量连接
     await this.jitterDelay();
 
+    // 创建连接前再次检查，避免用户点击断开后仍创建新连接
+    if (this._manualAborted.has(accountId) || !this.isAutoConnectAllowed(accountId)) {
+      this.releaseSlot();
+      throw new Error(`账号 ${accountId} 已手动断开，需手动重新连接`);
+    }
+
     if (!wsUrl || !wsUrl.startsWith("wss://")) {
       this.releaseSlot();
       throw new Error(`[${accountId}] 无效的 WebSocket URL，Token 可能已过期或缺失`);
@@ -217,6 +258,12 @@ export class ConnectionPool {
     const urlPreview = wsUrl.length > 100 ? wsUrl.substring(0, 100) + "..." : wsUrl;
     this.log(`[${name}] 正在连接... [${this.activeCount}/${MAX_ACTIVE}]`, "debug");
 
+    // 调试：记录连接来源，帮助排查意外自动连接
+    try {
+      const stack = new Error("连接来源").stack.split("\n").slice(2, 8).map(s => s.trim()).join(" | ");
+      this.log(`[${name}] 连接来源: ${stack}`, "debug");
+    } catch {}
+
     const client = new GameWsClient({
       url: wsUrl,
       heartbeatMs: 5000,
@@ -226,7 +273,7 @@ export class ConnectionPool {
     });
     const clientRef = client;
 
-    const connEntry = { client, status: "connecting", hasSlot: true };
+    const connEntry = { client, status: "connecting", hasSlot: true, roleName: "" };
     this.connections.set(accountId, connEntry);
 
     // 把本次连接实际使用的 token/wsUrl 保存到闭包，供回调使用
@@ -297,6 +344,12 @@ export class ConnectionPool {
         try {
           const roleInfo = await client.sendWithPromise("role_getroleinfo", {}, 8000);
           this.log(`[${name}] 角色信息获取成功`);
+
+          // 缓存真实角色名，供后续日志统一使用
+          const roleName = roleInfo?.role?.name || roleInfo?.name || "";
+          if (roleName) {
+            connEntry.roleName = roleName;
+          }
 
           // 更新角色信息到数据库
           if (roleInfo) {
@@ -395,12 +448,15 @@ export class ConnectionPool {
 
   /**
    * 释放任务槽位：任务结束或最终失败时调用
+   * @param {boolean} preserveAbort - 是否保留手动中止标记，默认 false
    */
-  async releaseTaskSlot(accountId) {
+  async releaseTaskSlot(accountId, preserveAbort = false) {
     if (!this._taskSlots.has(accountId)) return;
     this._taskSlots.delete(accountId);
-    // 任务结束（无论成功/失败），清除手动中止标记
-    this.clearAbort(accountId);
+    // 任务结束（无论成功/失败），清除手动中止标记，除非调用方要求保留
+    if (!preserveAbort) {
+      this.clearAbort(accountId);
+    }
     const name = this._accountName(accountId);
     // 清理连接并释放槽位；若连接记录已不存在但 activeCount 仍被占用，兜底释放一次
     const hadConn = this.connections.has(accountId);
@@ -415,13 +471,18 @@ export class ConnectionPool {
 
   /**
    * 断开某个账号（非任务期间调用）
+   * @param {boolean} abort - 是否标记为手动中止，默认 true
    */
-  async disconnect(accountId) {
-    // 标记为手动中止，使正在运行的任务停止而不是自动重连
-    this.abortAccount(accountId);
+  async disconnect(accountId, abort = true) {
+    if (abort) {
+      // 禁止该账号自动重连，并标记为手动中止，使正在运行的任务停止
+      this.allowAutoConnect(accountId, false);
+      this.abortAccount(accountId);
+    }
     if (this._taskSlots.has(accountId)) {
       this.log(`[${this._accountName(accountId)}] 当前正在执行任务，使用 releaseTaskSlot 释放`, "warning");
-      return this.releaseTaskSlot(accountId);
+      // 保留手动中止标记，确保正在运行的任务能检测到用户已手动断开并停止
+      return this.releaseTaskSlot(accountId, abort);
     }
     await this._cleanupConnection(accountId);
     this._clearSessionCache(accountId);
@@ -439,12 +500,14 @@ export class ConnectionPool {
    * 断开所有连接
    */
   disconnectAll() {
-    // 标记所有当前连接账号为手动中止，使正在运行的任务停止
+    // 标记所有当前连接账号为手动中止，并禁止自动重连
     for (const id of this.connections.keys()) {
       this.abortAccount(id);
+      this.allowAutoConnect(id, false);
     }
     for (const id of this._taskSlots) {
       this.abortAccount(id);
+      this.allowAutoConnect(id, false);
     }
     for (const [id, conn] of this.connections) {
       conn.client.destroy();
@@ -641,6 +704,16 @@ export class ConnectionPool {
     const account = db.getAccount(accountId);
     if (!account) throw new Error(`账号 ${accountId} 不存在`);
 
+    // 账号已被手动中止（用户点击断开），拒绝自动重连，直到下次手动连接
+    if (this._manualAborted.has(accountId)) {
+      throw new Error(`账号 ${accountId} 已手动断开，需手动重新连接`);
+    }
+
+    // 用户手动断开后，该账号不允许自动重连，直到手动连接或新任务开始
+    if (!this.isAutoConnectAllowed(accountId)) {
+      throw new Error(`账号 ${accountId} 已手动断开，需手动重新连接`);
+    }
+
     const conn = this.connections.get(accountId);
     if (conn && conn.status === "connected") return conn.client;
 
@@ -654,6 +727,11 @@ export class ConnectionPool {
     const lastAck = this._lastRecvSeq.get(accountId) || 0;
 
     for (let attempt = 0; attempt < maxRetries; attempt++) {
+      // 每次重试前检查是否被手动断开或禁止自动连接，避免用户点击断开后仍继续重连
+      if (this._manualAborted.has(accountId) || !this.isAutoConnectAllowed(accountId)) {
+        throw new Error(`账号 ${accountId} 已手动断开，需手动重新连接`);
+      }
+
       try {
         // 关键：onTokenExpired 可能在任意一次 _connectLocked 执行期间异步触发，
         // 每次循环前重新检查信号，确保能立即响应 token expired 并执行完整刷新。

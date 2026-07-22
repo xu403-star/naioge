@@ -4,11 +4,17 @@
 import initSqlJs from "sql.js";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, copyFileSync, unlinkSync, statSync } from "fs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DB_DIR = join(__dirname, "..", "data");
 const DB_PATH = join(DB_DIR, "cloud-bot.db");
+const BACKUP_DIR = join(DB_DIR, "backups");
+const FULL_BACKUP_DIR = join(BACKUP_DIR, "_full");           // 全库备份（兜底，含 users/sessions 等公共表）
+const MAX_BACKUPS = 20;                                       // 全库备份保留份数
+const MAX_BACKUPS_PER_USER = 10;                              // 每用户备份保留份数
+// 按用户备份的业务表清单（这些表都有 user_key 字段）
+const PER_USER_TABLES = ["accounts", "task_schedules", "task_templates", "user_settings", "task_logs"];
 
 // 确保 data 目录存在
 if (!existsSync(DB_DIR)) mkdirSync(DB_DIR, { recursive: true });
@@ -16,6 +22,7 @@ if (!existsSync(DB_DIR)) mkdirSync(DB_DIR, { recursive: true });
 let db = null;        // sql.js Database 实例 (异步初始化)
 let dbReady = false;
 let dbReadyPromise = null;
+let SQLModule = null;  // sql.js 模块（initDatabase 后保存，供按用户备份创建新 Database 用）
 
 /**
  * 初始化数据库（异步，因为 sql.js 需要加载 WASM）
@@ -26,6 +33,7 @@ export async function initDatabase() {
 
   dbReadyPromise = (async () => {
     const SQL = await initSqlJs();
+    SQLModule = SQL; // 保存供 backupUserDatabase 创建新 Database 用
 
     // 如果已有数据库文件，加载它；否则创建新数据库
     if (existsSync(DB_PATH)) {
@@ -243,6 +251,138 @@ export async function initDatabase() {
 }
 
 /**
+ * 清理旧的全库备份，只保留最近 MAX_BACKUPS 份
+ * 兼容旧版：迁移 BACKUP_DIR 根目录下的旧 cloud-bot.db.*.db 到 _full/
+ */
+function cleanupOldBackups() {
+  try {
+    if (!existsSync(FULL_BACKUP_DIR)) mkdirSync(FULL_BACKUP_DIR, { recursive: true });
+
+    // 迁移旧版备份（BACKUP_DIR 根目录下的 cloud-bot.db.*.db）到 _full/
+    // 兼容性逻辑：确保升级后旧备份不丢失
+    try {
+      const legacyFiles = readdirSync(BACKUP_DIR)
+        .filter(f => f.startsWith("cloud-bot.db.") && f.endsWith(".db"));
+      for (const f of legacyFiles) {
+        const src = join(BACKUP_DIR, f);
+        const dst = join(FULL_BACKUP_DIR, f);
+        if (!existsSync(dst)) copyFileSync(src, dst);
+        unlinkSync(src);
+      }
+    } catch {}
+
+    // 清理 _full/ 下过期的全库备份
+    const files = readdirSync(FULL_BACKUP_DIR)
+      .filter(f => f.startsWith("cloud-bot.db.") && f.endsWith(".db"))
+      .map(f => ({ name: f, time: statSync(join(FULL_BACKUP_DIR, f)).mtime.getTime() }))
+      .sort((a, b) => b.time - a.time);
+    for (let i = MAX_BACKUPS; i < files.length; i++) {
+      unlinkSync(join(FULL_BACKUP_DIR, files[i].name));
+    }
+  } catch (e) {
+    console.error("[DB] 清理旧备份失败:", e.message);
+  }
+}
+
+/**
+ * 清理某用户目录下过期的备份，只保留最近 MAX_BACKUPS_PER_USER 份
+ * @param {string} userDir 用户备份目录绝对路径
+ * @param {string} prefix 备份文件名前缀（通常是 user_key）
+ */
+function cleanupOldUserBackups(userDir, prefix) {
+  try {
+    if (!existsSync(userDir)) return;
+    const files = readdirSync(userDir)
+      .filter(f => f.startsWith(prefix + ".") && f.endsWith(".db"))
+      .map(f => ({ name: f, time: statSync(join(userDir, f)).mtime.getTime() }))
+      .sort((a, b) => b.time - a.time);
+    for (let i = MAX_BACKUPS_PER_USER; i < files.length; i++) {
+      unlinkSync(join(userDir, files[i].name));
+    }
+  } catch (e) {
+    console.error(`[DB] 清理用户 ${prefix} 旧备份失败:`, e.message);
+  }
+}
+
+/**
+ * 为单个用户创建业务数据快照（不含 users/sessions 等公共表）
+ * 方案1：users 表只进全库备份，不按用户拆分；业务表按 user_key 导出
+ * @param {string} userKey 用户标识
+ * @param {string} timestamp ISO 时间戳字符串（已替换非法字符）
+ */
+function backupUserDatabase(userKey, timestamp) {
+  if (!db || !SQLModule || !userKey) return;
+  try {
+    const userDb = new SQLModule.Database();
+
+    // 建空表（schema 与主库一致）
+    userDb.run(`CREATE TABLE accounts (id TEXT PRIMARY KEY, user_key TEXT, name TEXT, token TEXT, ws_url TEXT, bin_base64 TEXT, platform TEXT, server_id TEXT, platform_ext TEXT, role_id TEXT, role_name TEXT, level INTEGER, enabled INTEGER, connected INTEGER, last_login TEXT, settings TEXT, import_method TEXT, source_url TEXT, upgraded_to_permanent INTEGER, upgraded_at TEXT, created_at TEXT, updated_at TEXT)`);
+    userDb.run(`CREATE TABLE task_schedules (id INTEGER PRIMARY KEY AUTOINCREMENT, user_key TEXT, name TEXT, cron TEXT, enabled INTEGER, account_ids TEXT, operation TEXT, config TEXT, concurrency INTEGER, created_at TEXT)`);
+    userDb.run(`CREATE TABLE task_templates (id INTEGER PRIMARY KEY AUTOINCREMENT, user_key TEXT, name TEXT, content TEXT, created_at TEXT)`);
+    userDb.run(`CREATE TABLE user_settings (user_key TEXT, setting_key TEXT, setting_value TEXT, PRIMARY KEY (user_key, setting_key))`);
+    userDb.run(`CREATE TABLE task_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, user_key TEXT, account_id TEXT, account_name TEXT, task_type TEXT, message TEXT, level TEXT, created_at TEXT)`);
+
+    // 从主库导出该用户的数据到用户库
+    for (const table of PER_USER_TABLES) {
+      try {
+        const rows = queryAll(`SELECT * FROM ${table} WHERE user_key = ?`, [userKey]);
+        for (const row of rows) {
+          const cols = Object.keys(row);
+          const placeholders = cols.map(() => "?").join(",");
+          const values = cols.map(c => row[c]);
+          try {
+            userDb.run(`INSERT INTO ${table} (${cols.join(",")}) VALUES (${placeholders})`, values);
+          } catch {}
+        }
+      } catch (e) {
+        console.error(`[DB] 导出用户 ${userKey} 表 ${table} 失败:`, e.message);
+      }
+    }
+
+    // 写入用户备份目录
+    const userDir = join(BACKUP_DIR, userKey.replace(/[\\/:*?"<>|]/g, "_")); // 防非法字符
+    if (!existsSync(userDir)) mkdirSync(userDir, { recursive: true });
+    const userBackupPath = join(userDir, `${userKey.replace(/[\\/:*?"<>|]/g, "_")}.${timestamp}.db`);
+    const data = userDb.export();
+    writeFileSync(userBackupPath, Buffer.from(data));
+    cleanupOldUserBackups(userDir, userKey.replace(/[\\/:*?"<>|]/g, "_"));
+    userDb.close();
+  } catch (e) {
+    console.error(`[DB] 备份用户 ${userKey} 数据失败:`, e.message);
+  }
+}
+
+/**
+ * 创建数据库历史快照（全库 + 按用户）
+ * - 全库快照：到 backups/_full/，含所有表（含 users/sessions 等公共表），兜底用
+ * - 按用户快照：到 backups/{user_key}/，仅含业务表，用于单用户精细还原
+ */
+function backupDatabase() {
+  try {
+    if (!existsSync(FULL_BACKUP_DIR)) mkdirSync(FULL_BACKUP_DIR, { recursive: true });
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+
+    // 1. 全库备份（兜底）
+    const fullPath = join(FULL_BACKUP_DIR, `cloud-bot.db.${timestamp}.db`);
+    copyFileSync(DB_PATH, fullPath);
+    cleanupOldBackups();
+
+    // 2. 按用户备份（精细还原）
+    const users = queryAll("SELECT user_key FROM users");
+    for (const u of users) {
+      backupUserDatabase(u.user_key, timestamp);
+    }
+    // 兼容：accounts 里可能有 user_key 不在 users 表的脏数据，也备份一份
+    const orphanUsers = queryAll("SELECT DISTINCT user_key FROM accounts WHERE user_key NOT IN (SELECT user_key FROM users)");
+    for (const u of orphanUsers) {
+      backupUserDatabase(u.user_key, timestamp);
+    }
+  } catch (e) {
+    console.error("[DB] 备份数据库失败:", e.message);
+  }
+}
+
+/**
  * 将数据库写入磁盘（sql.js 是内存数据库，需要手动保存）
  */
 function saveToDisk() {
@@ -251,6 +391,7 @@ function saveToDisk() {
     const data = db.export();
     const buf = Buffer.from(data);
     writeFileSync(DB_PATH, buf);
+    backupDatabase();
   } catch (e) {
     console.error("保存数据库失败:", e.message);
   }
@@ -392,9 +533,11 @@ export function removeAccount(id, userKey) {
 export function updateAccountConnection(id, connected, roleInfo, userKey) {
   const data = { connected: connected ? 1 : 0, last_login: new Date().toISOString() };
   if (roleInfo) {
-    data.role_id = roleInfo.roleId || roleInfo.id || '';
-    data.role_name = roleInfo.name || roleInfo.roleName || '';
-    data.level = roleInfo.level || 0;
+    // roleInfo 可能直接是 role 对象，也可能是 { role: {...} }
+    const role = roleInfo.role || roleInfo;
+    data.role_id = roleInfo.roleId || roleInfo.id || role.roleId || role.id || '';
+    data.role_name = roleInfo.name || roleInfo.roleName || role.name || role.roleName || '';
+    data.level = roleInfo.level || role.level || 0;
   }
   updateAccount(id, data, userKey);
 }

@@ -11,7 +11,6 @@
       <button class="btn btn-sm" :class="sseOn ? 'btn-primary' : 'btn-outline'" @click="toggleSSE">
         {{ sseOn ? '● SSE 连接中' : '○ 开始监听' }}
       </button>
-      <button class="btn btn-sm btn-outline" @click="$router.push('/logs/dream-shop')">梦境购买日志</button>
       <button class="btn btn-sm btn-outline" @click="loadLogs">刷新</button>
       <button class="btn btn-sm btn-outline" @click="logs = []" style="color:var(--danger)">清屏</button>
     </div>

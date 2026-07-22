@@ -15,6 +15,7 @@ class RateLimiter {
     this.requests = [];
     this.queueSize = 0;
     this.onWaitCallback = null;
+    this.lastWaitMs = 0; // 本次 schedule 等待了多少毫秒（供调用方读取）
   }
 
   onWait(callback) { this.onWaitCallback = callback; }
@@ -50,8 +51,28 @@ class RateLimiter {
 
   async schedule(fn) {
     this.queueSize++;
-    try { await this.waitForSlot(); return fn(); }
-    finally { this.queueSize--; }
+    this.lastWaitMs = 0;
+    const start = Date.now();
+    try {
+      await this.waitForSlot();
+      // 实际等待时长 = 排队结束时间 - 入队时间（未触发限流时接近 0）
+      this.lastWaitMs = Date.now() - start;
+      return fn();
+    } finally {
+      this.queueSize--;
+    }
+  }
+
+  /**
+   * 获取当前预估等待时间（毫秒）。
+   * 若窗口已满，返回最早请求过期所需时间；否则返回 0。
+   * 供前端在批次开始前显示倒计时使用。
+   */
+  getEstimatedWaitMs() {
+    this.cleanOldRequests();
+    if (this.requests.length < this.maxRequests) return 0;
+    const oldest = this.requests[0];
+    return Math.max(0, oldest + this.windowMs - Date.now() + 100);
   }
 }
 
@@ -79,43 +100,50 @@ function arrayBufferToBuffer(ab) {
  *   1. POST BIN 到 /login/authuser
  *   2. 解析 BON 响应获取 combUser 数据
  *   3. 添加 sessId/connId/isRestore → JSON.stringify
+ *
+ * 【全局限流】所有调用点（BIN批处理/单个添加/token刷新/连接池重连/预刷新）
+ * 都走 authUserLimiter（25 次/分钟），统一在此函数内排队等待，
+ * 防止服务端返回"操作过快"。调用方无需自己实现限流。
  * @param {ArrayBuffer} arrayBuffer - BIN文件的ArrayBuffer
  * @returns {Promise<string>} - JSON格式的Token字符串
  */
 export async function transformToken(arrayBuffer) {
-  const res = await axios.post(
-    "https://xxz-xyzw.hortorgames.com/login/authuser",
-    arrayBuffer,
-    {
-      params: { _seq: 1 },
-      headers: {
-        "Content-Type": "application/octet-stream",
-        referrerPolicy: "no-referrer",
-      },
-      responseType: "arraybuffer",
+  return authUserLimiter.schedule(async () => {
+    const res = await axios.post(
+      "https://xxz-xyzw.hortorgames.com/login/authuser",
+      arrayBuffer,
+      {
+        params: { _seq: 1 },
+        headers: {
+          "Content-Type": "application/octet-stream",
+          referrerPolicy: "no-referrer",
+        },
+        responseType: "arraybuffer",
+        timeout: 30000, // 30 秒超时，防止请求卡死导致整个批量刷新停住
+      }
+    );
+
+    const u8 = new Uint8Array(res.data);
+    const enc = getEnc("auto");
+    const plain = enc.decrypt(u8);
+    const raw = bon.decode(plain);
+    const msg = new ProtoMsg(raw);
+    const data = msg.getData();
+
+    if (msg.code !== 0 && msg.code !== undefined) {
+      throw new Error(`authuser 失败: ${msg.error || msg.hint || msg.code}`);
     }
-  );
 
-  const u8 = new Uint8Array(res.data);
-  const enc = getEnc("auto");
-  const plain = enc.decrypt(u8);
-  const raw = bon.decode(plain);
-  const msg = new ProtoMsg(raw);
-  const data = msg.getData();
+    const currentTime = Date.now();
+    const sessId = currentTime * 100 + Math.floor(Math.random() * 100);
+    const connId = currentTime + Math.floor(Math.random() * 10);
 
-  if (msg.code !== 0 && msg.code !== undefined) {
-    throw new Error(`authuser 失败: ${msg.error || msg.hint || msg.code}`);
-  }
-
-  const currentTime = Date.now();
-  const sessId = currentTime * 100 + Math.floor(Math.random() * 100);
-  const connId = currentTime + Math.floor(Math.random() * 10);
-
-  return JSON.stringify({
-    ...data,
-    sessId,
-    connId,
-    isRestore: 0,
+    return JSON.stringify({
+      ...data,
+      sessId,
+      connId,
+      isRestore: 0,
+    });
   });
 }
 
@@ -196,6 +224,7 @@ export async function getServerList(arrayBuffer) {
       params: { _seq: 3 },
       headers: { "Content-Type": "application/octet-stream" },
       responseType: "arraybuffer",
+      timeout: 15000, // 15 秒超时，防止卡死
     }
   );
 
