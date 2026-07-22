@@ -993,7 +993,7 @@ app.post("/api/control/disconnect-all", (req, res) => {
   res.json({ success: true });
 });
 
-/** 一键执行指定账号列表的每日任务 */
+/** 一键执行指定账号列表的每日任务（用 batchEngine 跟踪状态，但不走 batchEngine.run 以避免与 taskRunner 的槽位管理冲突） */
 app.post("/api/control/run-daily-batch", async (req, res) => {
   const { accountIds, settings } = req.body || {};
   if (!accountIds || !Array.isArray(accountIds) || !accountIds.length) {
@@ -1003,25 +1003,49 @@ app.post("/api/control/run-daily-batch", async (req, res) => {
   const accounts = db.getAllAccounts(req.userKey).filter(a => accountIds.includes(a.id));
   if (!accounts.length) return res.status(400).json({ error: "没有找到匹配的账号" });
 
-  res.json({ success: true, message: `开始执行 ${accounts.length} 个账号的每日任务` });
+  const ids = accounts.map(a => a.id);
+  const runId = batchEngine.createRun("daily", ids, req.body || {}, {
+    userKey: req.userKey,
+    onLog: (entry) => addLog({ ...entry }),
+  });
+  const run = batchEngine.runs.get(runId);
+
+  res.json({ success: true, message: `开始执行 ${accounts.length} 个账号的每日任务`, runId });
   addLog({ message: `批量每日任务(选中): ${accounts.length} 个账号`, level: "info" });
 
-  for (const account of accounts) {
-    const accountName = account.role_name || account.name;
-    try {
-      await taskRunner.run(account.id, {
-        onLog: (entry) => {
-          addLog({ ...entry, accountId: account.id, message: `[${accountName}] ${entry.message}` });
-          db.addLog(account.id, account.name, "批量每日任务", entry.message, entry.type || "info", req.userKey);
-        },
-      }, withGlobalDelay(settings || null));
-      addLog({ message: `[${accountName}] 每日任务完成`, level: "success" });
-    } catch (error) {
-      addLog({ message: `[${accountName}] 每日任务失败: ${error.message}`, level: "error" });
-      db.addLog(account.id, account.name, "批量每日任务", "error", error.message, req.userKey);
+  // 后台异步执行（串行，taskRunner.run 自行管理槽位/连接）
+  (async () => {
+    for (const account of accounts) {
+      if (run.aborted) {
+        run.status.set(account.id, "cancelled");
+        continue;
+      }
+      const accountId = account.id;
+      const accountName = account.role_name || account.name;
+      run.status.set(accountId, "running");
+      try {
+        await taskRunner.run(accountId, {
+          onLog: (entry) => {
+            const msg = `[${accountName}] ${entry.message}`;
+            addLog({ ...entry, accountId, message: msg });
+            db.addLog(accountId, account.name, "批量每日任务", entry.message, entry.type || "info", req.userKey);
+            run.logs.push({ time: new Date().toISOString(), accountId, message: msg, type: entry.type || "info" });
+          },
+        }, withGlobalDelay(settings || null));
+        run.status.set(accountId, "completed");
+        addLog({ message: `[${accountName}] 每日任务完成`, level: "success" });
+      } catch (error) {
+        run.status.set(accountId, "failed");
+        addLog({ message: `[${accountName}] 每日任务失败: ${error.message}`, level: "error" });
+        db.addLog(accountId, account.name, "批量每日任务", "error", error.message, req.userKey);
+      }
+      await new Promise(r => setTimeout(r, 3000));
     }
-    await new Promise(r => setTimeout(r, 3000));
-  }
+    run.completedAt = new Date();
+  })().catch((err) => {
+    console.error("[run-daily-batch] failed:", err);
+    run.completedAt = new Date();
+  });
 });
 
 /** 一键执行所有已连接账号的每日任务 */

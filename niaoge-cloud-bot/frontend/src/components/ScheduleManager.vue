@@ -768,6 +768,7 @@ async function deleteSchedule(s) {
 async function runScheduleNow(s) {
   if (executingIds.value.has(s.id)) return
   executingIds.value.add(s.id)
+  toast.show(`开始执行任务: ${s.name}`)
   try {
     const ids = s.account_ids === '*' ? internalAccounts.value.map(a => a.id) : (s.account_ids || '').split(',').filter(Boolean)
     const tasks = parseTaskList(s.task_list)
@@ -785,12 +786,19 @@ async function runScheduleNow(s) {
 }
 
 async function runTaskForAccounts(operation, ids, config) {
-  if (operation === 'daily') {
-    await api.post('/api/control/run-daily-batch', { accountIds: ids })
-  } else if (operation === 'connect') {
+  if (operation === 'connect') {
     for (const id of ids) await api.post(`/api/control/connect/${id}`)
-  } else if (operation === 'disconnect') {
+    return
+  }
+  if (operation === 'disconnect') {
     for (const id of ids) await api.post(`/api/control/disconnect/${id}`)
+    return
+  }
+  // daily 走专用接口（taskRunner 自管槽位/连接，仅用 batchEngine 跟踪状态）
+  // 其他操作走 batchEngine.run（自带槽位/连接管理）
+  let res
+  if (operation === 'daily') {
+    res = await api.post('/api/control/run-daily-batch', { accountIds: ids })
   } else {
     const body = { accountIds: ids }
     if (operation === 'chest') {
@@ -807,7 +815,23 @@ async function runTaskForAccounts(operation, ids, config) {
     } else if (operation === 'dreamShop') {
       body.purchaseList = config.purchaseList
     }
-    await api.post(`/api/batch/run-all/${operation}`, body)
+    res = await api.post(`/api/batch/run-all/${operation}`, body)
+  }
+  if (res?.runId) {
+    await waitForRunComplete(res.runId)
+  }
+}
+
+async function waitForRunComplete(runId) {
+  while (true) {
+    await new Promise(r => setTimeout(r, 1500))
+    let status
+    try {
+      status = await api.get(`/api/batch/status/${runId}`)
+    } catch {
+      break
+    }
+    if (status?.completedAt) break
   }
 }
 
