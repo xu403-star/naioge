@@ -3,11 +3,36 @@ niaoge-cloud-bot.zip
 node_modules/
 .env
 
-# Runtime data
+# 运行时数据库与备份（绝不提交，避免覆盖云端数据）
 niaoge-cloud-bot/data/cloud-bot.db
+niaoge-cloud-bot/data/cloud-bot.db-journal
+niaoge-cloud-bot/data/cloud-bot.db-wal
+niaoge-cloud-bot/data/backups/
+
+# 运行时日志数据（按用户隔离，7天有效期）
+niaoge-cloud-bot/data/car-log/
+niaoge-cloud-bot/data/dream-shop-log/
+
+# 题库保留（静态资源，需提交）
+!niaoge-cloud-bot/data/answer.json
+
+# 运行时日志文件
+*.log
+niaoge-cloud-bot/start-server.log
+niaoge-cloud-bot/server.log
 
 # Frontend build output
 niaoge-cloud-bot/dist-vue/
 
 # Temporary backups
 niaoge-cloud-bot/rollback-backup/
+
+# 部署包
+*.zip
+niaoge-cloud-bot-deploy-safe-*.zip
+
+# 系统/IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
