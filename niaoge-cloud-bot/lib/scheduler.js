@@ -57,6 +57,7 @@ export class Scheduler {
     this.jobs = new Map(); // scheduleId -> cronJob
     this.running = new Map(); // scheduleId -> Promise
     this.lastRunMinute = new Map(); // scheduleId -> YYYY-MM-DDTHH:mm
+    this._abortFlags = new Map(); // scheduleId(String) -> boolean（停止当前轮任务）
     this.onLog = null;
   }
 
@@ -175,6 +176,12 @@ export class Scheduler {
     }
 
     await runWithConcurrency(accountIds, maxActive, async (accountId) => {
+      // 检查调度级停止标志：已停止时跳过后续排队账号
+      if (this._abortFlags.get(String(id))) {
+        this.log(`[${name}] 已停止，跳过账号 ${accountId}`);
+        return;
+      }
+
       const account = db.getAccount(accountId);
       if (!account || !account.enabled) {
         this.log(`[${name}] 跳过已禁用账号: ${accountId}`, "warning");
@@ -194,10 +201,10 @@ export class Scheduler {
       let wasAborted = false;
       try {
         for (const task of normalizedTasks) {
-          // 手动断开后中止后续任务执行
-          if (this.pool.isAborted(accountId)) {
+          // 检查调度级停止标志或手动断开，中止后续任务执行
+          if (this._abortFlags.get(String(id)) || this.pool.isAborted(accountId)) {
             wasAborted = true;
-            accountLog(`${accountName} 已被手动中止，跳过剩余任务`);
+            accountLog(`${accountName} 已被停止，跳过剩余任务`);
             break;
           }
           const { key, config } = task;
@@ -235,7 +242,56 @@ export class Scheduler {
       }
     });
 
+    // 执行完毕后清除停止标志，确保下次定时触发时正常运行
+    this._abortFlags.delete(String(id));
     this.log(`[${name}] 定时任务执行完毕`, "success");
+  }
+
+  /**
+   * 停止指定调度当前正在执行的那一轮任务
+   * - 正在执行的账号通过 pool.abortAccount 中止当前操作
+   * - 后续排队账号通过 _abortFlags 跳过
+   * 不影响 cron job 本身，下次到点仍会正常触发
+   */
+  stopSchedule(id) {
+    const sid = String(id);
+    this._abortFlags.set(sid, true);
+    const schedule = db.getAllSchedules().find(s => String(s.id) === sid);
+    const name = schedule?.name || sid;
+    // 对该调度下所有可能正在执行的账号：设标志 + 主动断开连接（让 taskRunner 尽快退出）
+    if (schedule) {
+      const accountIds = schedule.account_ids === "*"
+        ? db.getAllAccounts().map(a => a.id)
+        : (schedule.account_ids || "").split(",").map(s => s.trim()).filter(Boolean);
+      for (const aid of accountIds) {
+        try {
+          this.pool.abortAccount(aid);
+          this.pool.allowAutoConnect(aid, false);
+          this.pool.disconnect(aid, true).catch(() => {});
+        } catch {}
+      }
+    }
+    this.log(`[${name}] 用户点击停止，正在中止当前轮任务（后续排队账号将被跳过）`, "warning");
+  }
+
+  /**
+   * 获取正在运行的调度 ID 列表
+   */
+  getRunningScheduleIds() {
+    return [...this.running.keys()];
+  }
+
+  /**
+   * 停止所有正在运行的调度任务，返回被停止的调度列表
+   */
+  stopAllRunning() {
+    const stopped = [];
+    for (const id of this.running.keys()) {
+      this.stopSchedule(id);
+      const schedule = db.getAllSchedules().find(s => String(s.id) === String(id));
+      stopped.push({ id, name: schedule?.name || id });
+    }
+    return stopped;
   }
 
   /**

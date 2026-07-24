@@ -27,6 +27,10 @@
           导入
           <input type="file" accept=".json" style="display:none" @change="importTasks" />
         </label>
+        <button class="btn btn-sm btn-danger" @click="stopAllTasks">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><rect x="6" y="6" width="12" height="12"/></svg>
+          全部停止
+        </button>
       </div>
     </div>
 
@@ -89,9 +93,9 @@
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="12" height="12"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
                 删除
               </button>
-              <button class="btn btn-xs btn-info" :disabled="executingIds.has(s.id)" @click="runScheduleNow(s)">
+              <button class="btn btn-xs btn-info" :disabled="executingIds.has(s.id) || runningScheduleIds.has(s.id)" @click="runScheduleNow(s)">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="12" height="12"><polygon points="5 3 19 12 5 21 5 3"/></svg>
-                {{ executingIds.has(s.id) ? '执行中...' : '立即执行' }}
+                {{ executingIds.has(s.id) || runningScheduleIds.has(s.id) ? '执行中...' : '立即执行' }}
               </button>
             </div>
           </div>
@@ -327,7 +331,7 @@ const props = defineProps({
   batchSettings: { type: Object, default: undefined },
 })
 
-const emit = defineEmits(['update:count', 'refresh'])
+const emit = defineEmits(['update:count', 'refresh', 'stop-all'])
 
 // 内部数据（当 props 未传入时自行加载）
 const internalAccounts = ref(props.accounts || [])
@@ -347,7 +351,9 @@ const schedules = ref([])
 const showListModal = ref(false)
 const showEditModal = ref(false)
 const editingSchedule = ref(null)
-const executingIds = ref(new Set())
+const executingIds = ref(new Map()) // id -> { runId, aborted }（手动立即执行）
+const runningScheduleIds = ref(new Set()) // id（cron 触发运行中）
+let runningPollInterval = null
 const activeCategory = ref('基础')
 
 const form = ref({
@@ -436,10 +442,12 @@ onMounted(async () => {
   }
   await loadSchedules()
   startCountdown()
+  startRunningPoll()
 })
 
 onUnmounted(() => {
   if (countdownInterval) clearInterval(countdownInterval)
+  if (runningPollInterval) clearInterval(runningPollInterval)
 })
 
 async function loadSchedules() {
@@ -766,18 +774,24 @@ async function deleteSchedule(s) {
 }
 
 async function runScheduleNow(s) {
-  if (executingIds.value.has(s.id)) return
-  executingIds.value.add(s.id)
+  if (executingIds.value.has(s.id) || runningScheduleIds.value.has(s.id)) return
+  executingIds.value.set(s.id, { runId: null, aborted: false })
   toast.show(`开始执行任务: ${s.name}`)
   try {
     const ids = s.account_ids === '*' ? internalAccounts.value.map(a => a.id) : (s.account_ids || '').split(',').filter(Boolean)
     const tasks = parseTaskList(s.task_list)
     for (const task of tasks) {
+      if (executingIds.value.get(s.id)?.aborted) break
       const key = typeof task === 'string' ? task : (task?.op || task?.key)
       const config = typeof task === 'object' ? task : {}
-      await runTaskForAccounts(key, ids, config)
+      await runTaskForAccounts(key, ids, config, (runId) => {
+        const info = executingIds.value.get(s.id)
+        if (info) info.runId = runId
+      })
     }
-    toast.show(`任务 ${s.name} 执行完成`)
+    if (!executingIds.value.get(s.id)?.aborted) {
+      toast.show(`任务 ${s.name} 执行完成`)
+    }
   } catch (e) {
     toast.show('执行失败: ' + e.message)
   } finally {
@@ -785,7 +799,7 @@ async function runScheduleNow(s) {
   }
 }
 
-async function runTaskForAccounts(operation, ids, config) {
+async function runTaskForAccounts(operation, ids, config, onRunId) {
   if (operation === 'connect') {
     for (const id of ids) await api.post(`/api/control/connect/${id}`)
     return
@@ -817,6 +831,7 @@ async function runTaskForAccounts(operation, ids, config) {
     }
     res = await api.post(`/api/batch/run-all/${operation}`, body)
   }
+  if (onRunId && res?.runId) onRunId(res.runId)
   if (res?.runId) {
     await waitForRunComplete(res.runId)
   }
@@ -832,6 +847,55 @@ async function waitForRunComplete(runId) {
       break
     }
     if (status?.completedAt) break
+  }
+}
+
+/** 轮询后端获取正在运行的定时任务（cron 触发） */
+function startRunningPoll() {
+  const poll = async () => {
+    try {
+      const data = await api.get('/api/control/schedules/running') || {}
+      runningScheduleIds.value = new Set((data.ids || []).map(id => Number(id)))
+    } catch {}
+  }
+  poll()
+  runningPollInterval = setInterval(poll, 3000)
+}
+
+/** 停止任务：手动立即执行的调 batchEngine.abort，cron 触发的调 scheduler.stopSchedule */
+async function stopScheduleTask(s) {
+  const info = executingIds.value.get(s.id)
+  if (info) {
+    info.aborted = true
+    if (info.runId) {
+      try { await api.post(`/api/batch/abort/${info.runId}`) } catch {}
+    }
+    toast.show(`任务 ${s.name} 已停止`)
+    return
+  }
+  if (runningScheduleIds.value.has(s.id)) {
+    try {
+      await api.post(`/api/control/schedules/${s.id}/stop`)
+      toast.show(`任务 ${s.name} 已发送停止信号`)
+    } catch (e) {
+      toast.show('停止失败: ' + e.message)
+    }
+  }
+}
+
+/** 停止所有任务（Accounts 批量 + 定时 cron + 定时立即执行） */
+async function stopAllTasks() {
+  try {
+    const res = await api.post('/api/control/stop-all', null, { timeout: 60000 })
+    toast.show(res.message || '已停止所有任务')
+  } catch (e) {
+    toast.show('停止失败: ' + e.message)
+  } finally {
+    // 无论成功失败都清理本地状态，并通知父组件重置 Accounts 批量状态
+    for (const [, info] of executingIds.value) info.aborted = true
+    executingIds.value.clear()
+    runningScheduleIds.value.clear()
+    emit('stop-all')
   }
 }
 

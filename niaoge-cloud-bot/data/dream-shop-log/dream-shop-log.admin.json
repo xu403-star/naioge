@@ -1,47 +1,38 @@
 [
   {
-    "time": "2026-07-09T01:50:01.045Z",
-    "accountId": "73f5431313cf3132bb1487187b674440",
-    "accountName": "1-6792-6792服",
-    "merchantId": 1,
-    "merchantName": "初级商人",
-    "itemIdx": 5,
-    "itemName": "咸神门票"
-  },
-  {
-    "time": "2026-07-09T01:50:01.771Z",
-    "accountId": "73f5431313cf3132bb1487187b674440",
-    "accountName": "1-6792-6792服",
-    "merchantId": 1,
-    "merchantName": "初级商人",
-    "itemIdx": 5,
-    "itemName": "咸神门票"
-  },
-  {
-    "time": "2026-07-09T01:50:02.503Z",
-    "accountId": "73f5431313cf3132bb1487187b674440",
-    "accountName": "1-6792-6792服",
-    "merchantId": 1,
-    "merchantName": "初级商人",
+    "time": "2026-07-23T07:33:19.942Z",
+    "accountId": "4fcc4ffe3365af55aae9fd2cbfa0ac03",
+    "accountName": "2-6788-6788服",
+    "merchantId": 2,
+    "merchantName": "中级商人",
     "itemIdx": 6,
-    "itemName": "咸神火把"
-  },
-  {
-    "time": "2026-07-09T01:50:03.228Z",
-    "accountId": "73f5431313cf3132bb1487187b674440",
-    "accountName": "1-6792-6792服",
-    "merchantId": 3,
-    "merchantName": "高级商人",
-    "itemIdx": 5,
     "itemName": "橙将碎片"
   },
   {
-    "time": "2026-07-09T01:50:04.034Z",
-    "accountId": "73f5431313cf3132bb1487187b674440",
-    "accountName": "1-6792-6792服",
-    "merchantId": 3,
-    "merchantName": "高级商人",
-    "itemIdx": 5,
-    "itemName": "橙将碎片"
+    "time": "2026-07-23T07:33:21.136Z",
+    "accountId": "4fcc4ffe3365af55aae9fd2cbfa0ac03",
+    "accountName": "2-6788-6788服",
+    "merchantId": 2,
+    "merchantName": "中级商人",
+    "itemIdx": 7,
+    "itemName": "紫将碎片"
+  },
+  {
+    "time": "2026-07-23T07:33:22.325Z",
+    "accountId": "4fcc4ffe3365af55aae9fd2cbfa0ac03",
+    "accountName": "2-6788-6788服",
+    "merchantId": 1,
+    "merchantName": "初级商人",
+    "itemIdx": 2,
+    "itemName": "木质宝箱"
+  },
+  {
+    "time": "2026-07-23T07:33:23.550Z",
+    "accountId": "4fcc4ffe3365af55aae9fd2cbfa0ac03",
+    "accountName": "2-6788-6788服",
+    "merchantId": 1,
+    "merchantName": "初级商人",
+    "itemIdx": 3,
+    "itemName": "青铜宝箱"
   }
 ]

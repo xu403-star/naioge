@@ -233,41 +233,42 @@ export class TaskRunner {
 
   /**
    * 执行游戏命令（增强版：优雅处理已知可忽略错误）
+   *
+   * 限流处理（参考 xyzw）：
+   * - 遇 400340/200750/11800010 立即标记 hasRateLimitError，不内部重试，直接抛出
+   * - 由外层 run() 的任务循环捕获并 break，交由 batchEngine 统一等待后断点续跑
    */
   async executeGameCommand(accountId, cmd, params = {}, description = "", timeout = 8000) {
-    // 400340 服务器限流：等待后重试1次（限流是临时状态，不应直接跳过影响后续奖励）
-    const MAX_ATTEMPTS = 2;
-    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-      try {
-        if (description) this.log(`${description}...`);
-        const result = await this.pool.sendMessage(accountId, cmd, params, timeout);
-        if (description) this.log(`${description} - 成功`, "success");
-        // 命令成功后应用通用命令延迟（commandDelay），让全局延迟作用于所有走此方法的命令
-        const cmdDelay = this.settings?.commandDelay;
-        if (cmdDelay && cmdDelay > 0) {
-          await new Promise(r => setTimeout(r, cmdDelay));
-        }
-        return result;
-      } catch (error) {
-        const errMsg = error.message || "";
-        // 400340 服务器限流：等待2秒后重试一次（仅首次）
-        if (/400340/.test(errMsg) && attempt === 0) {
-          if (description) this.log(`${description} - 服务器限流，等待后重试...`, "warning");
-          await new Promise(r => setTimeout(r, 2000));
-          continue;
-        }
-        // 检查是否为已知可忽略的错误码
-        for (const [code, desc] of Object.entries(SKIP_ERROR_CODES)) {
-          if (errMsg.includes(code) || errMsg.includes(desc)) {
-            if (description) this.log(`${description} - 跳过 (${desc})`, "warning");
-            return { skipped: true, code, message: desc };
-          }
-        }
-        if (description) {
-          this.log(`${description} - 失败: ${error.message}`, "error");
-        }
+    try {
+      if (description) this.log(`${description}...`);
+      const result = await this.pool.sendMessage(accountId, cmd, params, timeout);
+      if (description) this.log(`${description} - 成功`, "success");
+      // 命令成功后应用通用命令延迟（commandDelay），让全局延迟作用于所有走此方法的命令
+      const cmdDelay = this.settings?.commandDelay;
+      if (cmdDelay && cmdDelay > 0) {
+        await new Promise(r => setTimeout(r, cmdDelay));
+      }
+      return result;
+    } catch (error) {
+      const errMsg = error.message || "";
+      // 限流检测：遇 400340/200750/11800010 立即标记，不重试直接抛出
+      // 外层 run() 的任务循环会捕获并 break，由 batchEngine 的限流重试队列统一处理
+      if (/400340|200750|11800010/.test(errMsg)) {
+        this.hasRateLimitError = true;
+        if (description) this.log(`${description} - 服务器限流`, "warning");
         throw error;
       }
+      // 检查是否为已知可忽略的错误码
+      for (const [code, desc] of Object.entries(SKIP_ERROR_CODES)) {
+        if (errMsg.includes(code) || errMsg.includes(desc)) {
+          if (description) this.log(`${description} - 跳过 (${desc})`, "warning");
+          return { skipped: true, code, message: desc };
+        }
+      }
+      if (description) {
+        this.log(`${description} - 失败: ${error.message}`, "error");
+      }
+      throw error;
     }
   }
 
@@ -372,9 +373,19 @@ export class TaskRunner {
 
   /**
    * 执行每日任务（含活跃度智能判断，移植自 xyzw_web_helper）
+   *
+   * 支持限流断点续跑：
+   * - options.resumeFromTaskName 指定从哪个任务继续（跳过之前的）
+   * - 遇限流码（400340/200750/11800010）时标记 hasRateLimitError 并 break
+   * - 返回 { hasRateLimitError, resumeTaskName } 供外层统一等待后断点续跑
    */
-  async run(accountId, callbacks = {}, customSettings = null) {
+  async run(accountId, callbacks = {}, customSettings = null, options = {}) {
     this.callbacks = callbacks;
+    // 限流相关状态：每次 run 重置（外层重试时复用 resumeFromTaskName 实现断点续跑）
+    this.hasRateLimitError = false;
+    this.rateLimitTaskName = null;
+    const resumeFromTaskName = options.resumeFromTaskName || null;
+
     let settings = customSettings || this.loadSettings(accountId);
     // 应用强制设置：覆盖前端传入的 customSettings，确保 FORCED_SETTINGS 始终胜出
     if (settings && typeof settings === "object") {
@@ -388,13 +399,9 @@ export class TaskRunner {
     this.currentAccountName = accountName;
     this.currentRoleId = "";
 
-    // 辅助函数：上报活跃度并持久化
-    const reportDailyPoint = (point, max) => {
-      saveDailySnapshot(accountId, point, max);
-      if (callbacks?.onDailyPointUpdate) {
-        try { callbacks.onDailyPointUpdate(accountId, point, max); } catch {}
-      }
-    };
+    // 活跃度只在任务结束时保存一次最终值，执行过程中不再反复保存和推送
+    // 前端通过 API /api/accounts/:id/daily-point 读取最后一次保存的快照
+    const reportDailyPoint = (point, max) => {};
 
     this.log(`开始每日任务`);
 
@@ -411,14 +418,19 @@ export class TaskRunner {
       await this.pool.ensureConnected(accountId);
 
     // ====== 第一步：获取角色信息 ======
-    this.log("正在获取角色信息...");
-    let roleInfoResp;
-    try {
-      roleInfoResp = await this.pool.sendMessage(accountId, "role_getroleinfo", {}, 5000);
-      this.log("角色信息获取成功", "success");
-    } catch (error) {
-      this.log(`获取角色信息失败: ${error.message}`, "error");
-      throw error;
+    // 优先复用连接初始化时已缓存的角色信息，避免短时间内重复请求 role_getroleinfo 导致超时
+    let roleInfoResp = this.pool.getCachedRoleInfo ? this.pool.getCachedRoleInfo(accountId) : null;
+    if (roleInfoResp) {
+      this.log("角色信息获取成功（复用连接缓存）", "success");
+    } else {
+      this.log("正在获取角色信息...");
+      try {
+        roleInfoResp = await this.pool.sendMessage(accountId, "role_getroleinfo", {}, 5000);
+        this.log("角色信息获取成功", "success");
+      } catch (error) {
+        this.log(`获取角色信息失败: ${error.message}`, "error");
+        throw error;
+      }
     }
 
     const roleData = roleInfoResp?.role;
@@ -485,11 +497,18 @@ export class TaskRunner {
     }
 
     // ====== 第三步：多次刷新角色信息直到活跃度稳定 ======
+    // 停止信号检查：避免停止后又跑5次×5秒的刷新超时无用功
+    if (this.pool.isAborted(accountId)) {
+      this.log("检测到手动断开，停止执行任务", "warning");
+      return { stopped: true };
+    }
     try {
       const maxRefreshAttempts = 5;
       let previousPoint = -1;
       for (let attempt = 1; attempt <= maxRefreshAttempts; attempt++) {
+        if (this.pool.isAborted(accountId)) break;
         if (attempt > 1) await new Promise(r => setTimeout(r, 800));
+        if (this.pool.isAborted(accountId)) break;
         const freshRoleResp = await this.pool.sendMessage(accountId, "role_getroleinfo", {}, 5000);
         const freshDailyTask = freshRoleResp?.role?.dailyTask ?? freshRoleResp?.dailyTask ?? {};
         const { point: freshPoint, max: freshMax } = getDailyPointInfo(freshDailyTask);
@@ -526,9 +545,17 @@ export class TaskRunner {
 
     // 活跃度接近达标时额外校验
     if (currentDailyPoint >= 80 && currentDailyPoint < dailyPointMax) {
+      if (this.pool.isAborted(accountId)) {
+        this.log("检测到手动断开，停止执行任务", "warning");
+        return { stopped: true };
+      }
       try {
         this.log("活跃度接近达标，再次校验任务完成状态...");
         await new Promise(r => setTimeout(r, 600));
+        if (this.pool.isAborted(accountId)) {
+          this.log("检测到手动断开，停止执行任务", "warning");
+          return { stopped: true };
+        }
         const verifyResp = await this.pool.sendMessage(accountId, "role_getroleinfo", {}, 5000);
         const verifyDailyTask = verifyResp?.role?.dailyTask ?? verifyResp?.dailyTask ?? {};
         const { point: verifyPoint, max: verifyMax } = getDailyPointInfo(verifyDailyTask);
@@ -542,6 +569,12 @@ export class TaskRunner {
       } catch (e) {
         this.log(`活跃度校验失败: ${e.message}`, "warning");
       }
+    }
+
+    // 构建任务列表前最后检查一次
+    if (this.pool.isAborted(accountId)) {
+      this.log("检测到手动断开，停止执行任务", "warning");
+      return { stopped: true };
     }
 
     // ====== 构建任务列表 ======
@@ -936,12 +969,22 @@ export class TaskRunner {
     const totalTasks = taskList.length;
     this.log(`共有 ${totalTasks} 个任务待执行`);
 
+    // 断点续执行：如果指定了恢复任务名，跳过已完成的任务
+    let startIndex = 0;
+    if (resumeFromTaskName) {
+      const foundIndex = taskList.findIndex(t => t.name === resumeFromTaskName);
+      if (foundIndex >= 0) {
+        startIndex = foundIndex;
+        this.log(`从上次限流断点 "${resumeFromTaskName}" 继续执行`, "info");
+      }
+    }
+
     // 判断是否为连接/Token 类错误（需要刷新 token 重试）
     const isConnectionError = (errMsg) => {
       return /code=1006|连接失败|连接断开|连接超时|Token|令牌|未连接|timeout|WebSocket|ws/i.test(errMsg);
     };
 
-    for (let i = 0; i < taskList.length; i++) {
+    for (let i = startIndex; i < taskList.length; i++) {
       const task = taskList[i];
 
       // 如果用户手动点击了断开/断开全部，停止继续执行任务
@@ -988,6 +1031,14 @@ export class TaskRunner {
             break;
           }
 
+          // 限流码（400340/200750/11800010）：executeGameCommand 已标记 hasRateLimitError
+          // 立即 break 整个任务循环，记录断点，交由外层统一等待后断点续跑
+          if (this.hasRateLimitError) {
+            this.rateLimitTaskName = task.name;
+            this.log(`遇到服务器限流，停止后续任务（已完成 ${i}/${totalTasks}），等待外层重试`, "warning");
+            break;
+          }
+
           // 第一次失败且是连接/Token 类错误，尝试刷新 token 重连并重做当前任务
           if (attempt === 0 && isConnectionError(errMsg)) {
             // 如果已被手动中止或禁止自动连接，不再重连
@@ -1020,6 +1071,11 @@ export class TaskRunner {
         }
       }
 
+      // 限流后跳出整个循环（外层 break 只跳出 attempt 循环，这里再跳出 task 循环）
+      if (this.hasRateLimitError) {
+        break;
+      }
+
       // 成功执行且非时间跳过的日常限定任务，标记为今日已执行
       if (taskSuccess && !timeSkipped && task.dailyLimited) {
         markDone(task.name);
@@ -1032,8 +1088,12 @@ export class TaskRunner {
       await new Promise(r => setTimeout(r, settings.taskDelay));
     }
 
-    // ======== 二次领取积分（活跃度未达标时） ========
-    if (currentDailyPoint < 100) {
+    // ======== 二次领取积分（活跃度未达标时，限流时跳过） ========
+    if (this.pool.isAborted(accountId)) {
+      this.log("任务已停止，跳过二次领取积分", "warning");
+    } else if (this.hasRateLimitError) {
+      this.log("限流状态，跳过二次领取积分（将在外层重试时补领）", "warning");
+    } else if (currentDailyPoint < 100) {
       this.log(`当前活跃度 ${currentDailyPoint} 未达标，尝试二次领取任务积分...`);
 
       // 先刷新一次
@@ -1067,14 +1127,16 @@ export class TaskRunner {
               break;
             } catch (e) {
               const msg = e?.message || String(e);
-              if (/400340/.test(msg) && attempt === 0) {
-                retryRetried = true;
-                await new Promise(r => setTimeout(r, 2000));
-                continue;
+              // 限流码：标记并跳出二次领取（交由外层断点续跑统一处理）
+              if (/400340|200750|11800010/.test(msg)) {
+                this.hasRateLimitError = true;
+                this.log(`二次领取任务积分${taskId} - 服务器限流，停止二次领取`, "warning");
+                break;
               }
               break;
             }
           }
+          if (this.hasRateLimitError) break;
           await new Promise(r => setTimeout(r, retryRetried ? 500 : 300));
         }
         if (retryClaimedCount > 0) {
@@ -1083,18 +1145,36 @@ export class TaskRunner {
       }
     }
 
-    // ======== 最终刷新活跃度 ========
-    try {
-      const finalResp = await this.pool.sendMessage(accountId, "role_getroleinfo", {}, 5000);
-      const finalDailyTask = finalResp?.role?.dailyTask ?? {};
-      const { point: finalPoint, max: finalMax } = getDailyPointInfo(finalDailyTask);
-      this.log(`最终活跃度: ${finalPoint}/${finalMax}`, "success");
-      saveDailySnapshot(accountId, finalPoint, finalMax);
-      reportDailyPoint(finalPoint, finalMax);
-    } catch (e) { /* ignore */ }
+    // ======== 最终刷新活跃度（限流/中止时跳过） ========
+    if (this.pool.isAborted(accountId)) {
+      this.log("任务已停止，跳过最终刷新", "warning");
+    } else if (this.hasRateLimitError) {
+      this.log("限流状态，跳过最终刷新（将在外层重试时刷新）", "warning");
+    } else {
+      try {
+        const finalResp = await this.pool.sendMessage(accountId, "role_getroleinfo", {}, 5000);
+        const finalDailyTask = finalResp?.role?.dailyTask ?? {};
+        const { point: finalPoint, max: finalMax } = getDailyPointInfo(finalDailyTask);
+        this.log(`最终活跃度: ${finalPoint}/${finalMax}`, "success");
+        saveDailySnapshot(accountId, finalPoint, finalMax);
+        reportDailyPoint(finalPoint, finalMax);
+      } catch (e) { /* ignore */ }
+    }
 
     if (this.callbacks.onProgress) this.callbacks.onProgress(100);
-    this.log("所有任务执行完成", "success");
+    if (this.hasRateLimitError) {
+      this.log(`每日任务因限流中断（断点: ${this.rateLimitTaskName || "未知"}），等待外层重试`, "warning");
+    } else if (this.pool.isAborted(accountId)) {
+      this.log("每日任务已停止", "warning");
+    } else {
+      this.log("所有任务执行完成", "success");
+    }
+
+    // 返回限流信息供外层（batchEngine）做断点续跑
+    return {
+      hasRateLimitError: this.hasRateLimitError,
+      resumeTaskName: this.rateLimitTaskName,
+    };
     } finally {
       // 任务执行完毕后释放任务槽位（同时断开连接）
       this.log("释放任务槽位并断开连接", "info");

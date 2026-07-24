@@ -5,10 +5,16 @@ const DEFAULT_BATCH_SETTINGS = {
   maxActive: 2,
   commandDelay: 500,
   taskDelay: 500,
-  actionDelay: 300,
-  battleDelay: 500,
-  refreshDelay: 1000,
-  longDelay: 3000,
+  // 批次间间隔（一批账号跑完后等待多久再启动下一批）
+  batchDelay: 1000,
+  // 失败账号重试间隔（第一轮全部跑完后，失败账号等待多久再重试）
+  retryDelay: 3000,
+  // 失败账号最大重试次数
+  maxRetry: 1,
+  // 限流（400340/200750/11800010）断点续跑等待间隔
+  rateLimitRetryDelay: 60000,
+  // 限流断点续跑最大重试次数
+  maxRateLimitRetry: 3,
   boxCount: 100,
   fishCount: 100,
   recruitCount: 10,
@@ -76,62 +82,85 @@ export class BatchEngine {
 
   /**
    * 执行一次批量运行，返回最终状态
+   *
+   * 改造为分批模式（参考 xyzw runInBatches）：
+   * - 按 maxActive 切片成多批，批内并发、批间串行
+   * - 批间等待 batchDelay（用户可配，避免账号多时连环触发限流）
+   * - 第一轮跑完后，失败账号按批重试 maxRetry 次，重试间隔 retryDelay
+   *
+   * 可通过 options.executeOne 传入自定义单账号执行函数（如每日任务），
+   * 不传则走默认的 executeBatchOperation（普通批量操作）。
    */
-  async run(runId) {
+  async run(runId, options = {}) {
     const run = this.runs.get(runId);
     if (!run) throw new Error("批量运行不存在: " + runId);
 
-    const executing = new Set();
-    const queue = [...run.accountIds];
+    // 读取用户 batchSettings（含 maxActive/batchDelay/retryDelay/maxRetry 等）
+    const userSettings = run.userKey ? (db.getUserSetting(run.userKey, "batchSettings") || {}) : {};
+    const settings = { ...DEFAULT_BATCH_SETTINGS, ...userSettings, ...(run.body || {}) };
+    const maxActive = Math.max(1, Number(settings.maxActive) || this.maxConcurrency);
+    const batchDelay = Math.max(0, Number(settings.batchDelay) || 0);
+    const retryDelay = Math.max(0, Number(settings.retryDelay) || 0);
+    const maxRetry = Math.max(0, Number(settings.maxRetry) || 0);
 
-    const processNext = async () => {
-      if (run.aborted) return;
-      if (queue.length === 0) return;
-      if (executing.size >= this.maxConcurrency) return;
+    // 自定义单账号执行函数（每日任务用），不传则走默认
+    const customExecuteOne = options.executeOne || null;
 
-      const accountId = queue.shift();
-      executing.add(accountId);
+    // 单账号执行包装：状态流转 + 日志 + 槽位管理
+    const executeOne = async (accountId) => {
+      if (run.aborted) {
+        run.status.set(accountId, "cancelled");
+        this._emitStatus(run, accountId, "cancelled");
+        return;
+      }
       run.status.set(accountId, "running");
       this._emitStatus(run, accountId, "running");
 
+      // 使用连接中缓存的真实角色名，未连接时回退到数据库显示名
+      const name = this.pool
+        ? this.pool.getRoleName(accountId)
+        : (db.getAccount(accountId, run.userKey)?.name || accountId);
+      this._emitLog(run, accountId, `[${name}] 开始执行 ${this._getLabel(run.operation)}`, "info");
+
       try {
-        // 任务开始时恢复该账号的自动连接权限并清除中止标记
-        if (this.pool) {
-          this.pool.allowAutoConnect(accountId, true);
-          this.pool.clearAbort(accountId);
-        }
-
-        // 申请任务槽位，确保任务执行期间占用并发名额
-        if (this.pool) {
-          await this.pool.acquireTaskSlot(accountId).catch(() => {});
-        }
-
-        // 确保账号已连接，左侧状态显示在线
-        if (this.pool) {
-          try {
-            await this.pool.ensureConnected(accountId);
-          } catch (e) {
-            throw new Error(`连接失败: ${e.message}`);
+        if (customExecuteOne) {
+          // 每日任务路径：槽位/连接/释放全部由 taskRunner.run 内部管理
+          // batchEngine 只负责状态流转和日志，不重复 acquireTaskSlot/ensureConnected，否则会双重占用导致死锁
+          const logCb = (entry) => {
+            let message = entry.message || "";
+            const prefix = `[${name}]`;
+            if (message.startsWith(prefix)) {
+              message = message.slice(prefix.length).trimStart();
+            }
+            this._emitLog(run, accountId, `${prefix} ${message}`, entry.type || "info");
+          };
+          await customExecuteOne(accountId, logCb, name);
+        } else {
+          // 默认批量操作路径：由 batchEngine 管理槽位和连接
+          if (this.pool) {
+            this.pool.allowAutoConnect(accountId, true);
+            this.pool.clearAbort(accountId);
           }
-        }
-
-        // 使用连接中缓存的真实角色名，未连接时回退到数据库显示名
-        const name = this.pool
-          ? this.pool.getRoleName(accountId)
-          : (db.getAccount(accountId, run.userKey)?.name || accountId);
-        this._emitLog(run, accountId, `[${name}] 开始执行 ${this._getLabel(run.operation)}`, "info");
-
-        const logCb = (entry) => {
-          // 模块内部可能残留旧的 [name] 前缀，统一去掉后由本引擎加，确保格式一致且不重复
-          let message = entry.message || "";
-          const prefix = `[${name}]`;
-          if (message.startsWith(prefix)) {
-            message = message.slice(prefix.length).trimStart();
+          if (this.pool) {
+            await this.pool.acquireTaskSlot(accountId).catch(() => {});
           }
-          this._emitLog(run, accountId, `${prefix} ${message}`, entry.type || "info");
-        };
-
-        await executeBatchOperation(this.modules, run.operation, accountId, run.body, logCb, run.userKey);
+          if (this.pool) {
+            try {
+              await this.pool.ensureConnected(accountId);
+            } catch (e) {
+              throw new Error(`连接失败: ${e.message}`);
+            }
+          }
+          const logCb = (entry) => {
+            let message = entry.message || "";
+            const prefix = `[${name}]`;
+            if (message.startsWith(prefix)) {
+              message = message.slice(prefix.length).trimStart();
+            }
+            this._emitLog(run, accountId, `${prefix} ${message}`, entry.type || "info");
+          };
+          await executeBatchOperation(this.modules, run.operation, accountId, run.body, logCb, run.userKey);
+        }
         run.status.set(accountId, "completed");
         this._emitStatus(run, accountId, "completed");
         this._emitLog(run, accountId, `[${name}] ${this._getLabel(run.operation)} 执行完成`, "info");
@@ -140,34 +169,72 @@ export class BatchEngine {
         this._emitStatus(run, accountId, "failed");
         this._emitLog(run, accountId, `[${name}] 执行失败: ${error.message}`, "error");
       } finally {
-        executing.delete(accountId);
-        // 释放任务槽位，自动断开连接
-        if (this.pool) {
+        // 仅默认批量操作需要 batchEngine 释放槽位，每日任务由 taskRunner 自行释放
+        if (!customExecuteOne && this.pool) {
           await this.pool.releaseTaskSlot(accountId);
         }
-        // 尽快启动下一个
-        processNext();
       }
     };
 
-    // 初始启动最多 maxConcurrency 个任务
-    const starters = [];
-    const initialCount = Math.min(this.maxConcurrency, queue.length);
-    for (let i = 0; i < initialCount; i++) {
-      starters.push(processNext());
+    // 执行一批账号（批内并发）
+    const runBatch = async (batchIds) => {
+      await Promise.all(batchIds.map((id) => executeOne(id)));
+    };
+
+    const totalAccounts = run.accountIds.length;
+    const totalBatches = Math.ceil(totalAccounts / maxActive);
+
+    this._emitLog(run, null, `共 ${totalAccounts} 个账号，分 ${totalBatches} 批执行，每批 ${maxActive} 个`, "info");
+
+    // ===== 第一轮：按批次执行所有账号 =====
+    for (let batchIdx = 0; batchIdx < totalBatches; batchIdx++) {
+      if (run.aborted) break;
+      const start = batchIdx * maxActive;
+      const end = Math.min(start + maxActive, totalAccounts);
+      const batchIds = run.accountIds.slice(start, end);
+
+      this._emitLog(run, null, `批次 ${batchIdx + 1}/${totalBatches} 开始执行 ${batchIds.length} 个账号`, "info");
+      await runBatch(batchIds);
+      this._emitLog(run, null, `批次 ${batchIdx + 1}/${totalBatches} 执行完成`, "success");
+
+      // 批间延迟（非最后一批）
+      if (batchIdx + 1 < totalBatches && !run.aborted && batchDelay > 0) {
+        this._emitLog(run, null, `等待 ${batchDelay / 1000} 秒后执行下一批...`, "info");
+        await new Promise((r) => setTimeout(r, batchDelay));
+      }
     }
 
-    // 等待所有任务完成或中止
-    while (executing.size > 0 || queue.length > 0) {
-      if (run.aborted) {
-        // 已中止时，把排队中的账号标记为 cancelled，不再启动
-        while (queue.length > 0) {
-          const id = queue.shift();
-          run.status.set(id, "cancelled");
-          this._emitStatus(run, id, "cancelled");
+    // ===== 第二轮：失败账号重试（也按批次） =====
+    if (maxRetry > 0 && !run.aborted) {
+      let failedIds = run.accountIds.filter((id) => run.status.get(id) === "failed");
+
+      for (let retryIdx = 0; retryIdx < maxRetry && failedIds.length > 0 && !run.aborted; retryIdx++) {
+        this._emitLog(run, null, `第 ${retryIdx + 1}/${maxRetry} 次重试：${failedIds.length} 个账号失败，等待 ${retryDelay / 1000} 秒`, "warning");
+        if (retryDelay > 0) {
+          await new Promise((r) => setTimeout(r, retryDelay));
         }
+        if (run.aborted) break;
+
+        // 重试前重置状态为 waiting
+        failedIds.forEach((id) => {
+          run.status.set(id, "waiting");
+          this._emitStatus(run, id, "waiting");
+        });
+
+        const retryBatches = Math.ceil(failedIds.length / maxActive);
+        for (let batchIdx = 0; batchIdx < retryBatches && !run.aborted; batchIdx++) {
+          const start = batchIdx * maxActive;
+          const end = Math.min(start + maxActive, failedIds.length);
+          const batchIds = failedIds.slice(start, end);
+          this._emitLog(run, null, `重试批次 ${batchIdx + 1}/${retryBatches} 开始执行 ${batchIds.length} 个账号`, "info");
+          await runBatch(batchIds);
+        }
+        failedIds = run.accountIds.filter((id) => run.status.get(id) === "failed");
       }
-      await new Promise((r) => setTimeout(r, 100));
+
+      if (failedIds.length > 0) {
+        this._emitLog(run, null, `${failedIds.length} 个账号重试后仍失败`, "error");
+      }
     }
 
     run.completedAt = new Date();
@@ -183,6 +250,34 @@ export class BatchEngine {
     run.aborted = true;
     run.abortController.abort();
     return true;
+  }
+
+  /**
+   * 中止所有未完成的运行，返回被中止的 runId 列表
+   */
+  abortAll() {
+    const stopped = [];
+    for (const [runId, run] of this.runs) {
+      if (!run.completedAt) {
+        run.aborted = true;
+        run.abortController.abort();
+        stopped.push(runId);
+      }
+    }
+    return stopped;
+  }
+
+  /**
+   * 获取所有未完成运行的账号列表（用于统一断开连接）
+   */
+  getActiveAccountIds() {
+    const ids = new Set();
+    for (const [, run] of this.runs) {
+      if (!run.completedAt) {
+        for (const aid of run.accountIds) ids.add(aid);
+      }
+    }
+    return [...ids];
   }
 
   /**
@@ -286,7 +381,6 @@ export async function executeBatchOperation(modules, operation, accountId, body 
           ticket: s.ticketThreshold ?? s.carTicketThreshold ?? 4,
         },
         assignHelper: s.assignHelper ?? true,
-        delay: s.delay || { action: s.actionDelay ?? 300, refresh: s.refreshDelay ?? 1000 },
       }, logCb, userKey);
     case "claimCars": return m.car.claimAll(accountId, logCb);
     case "blackMarket": return m.store.storeQuickPurchase(accountId, logCb, { force: s.force });

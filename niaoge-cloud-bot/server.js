@@ -66,12 +66,16 @@ const scheduler = new Scheduler(pool, taskRunner, {
     daily: async (accountId, log) => {
       const account = db.getAccount(accountId);
       const accountName = account?.name || accountId;
-      await taskRunner.run(accountId, {
+      const runner = new TaskRunner(pool);
+      await runner.run(accountId, {
         onLog: (entry) => {
           log(`[${accountName}] ${entry.message}`, entry.type || "info");
           db.addLog(accountId, accountName, "daily", entry.message, entry.type || "info", account?.user_key);
         },
         onProgress: () => {},
+        onDailyPointUpdate: (aid, point, max) => {
+          addLog({ accountId: aid, message: `__DAILY_POINT_UPDATE__:${point}/${max}`, type: "info" });
+        },
       }, withGlobalDelay(null));
     },
     connect: async (accountId, log) => {
@@ -363,10 +367,11 @@ const DEFAULT_BATCH_SETTINGS = {
   maxActive: 2,
   commandDelay: 500,
   taskDelay: 500,
-  actionDelay: 300,
-  battleDelay: 500,
-  refreshDelay: 1000,
-  longDelay: 3000,
+  batchDelay: 1000,
+  retryDelay: 3000,
+  maxRetry: 1,
+  rateLimitRetryDelay: 60000,
+  maxRateLimitRetry: 3,
   boxCount: 100,
   fishCount: 100,
   recruitCount: 10,
@@ -649,6 +654,29 @@ app.post("/api/logs/dream-shop/clear", (req, res) => {
   }
 });
 
+/** 删除单条梦境购买日志（按 time+accountName+merchantName+itemName 匹配） */
+app.post("/api/logs/dream-shop/delete", (req, res) => {
+  try {
+    const { time, accountName, merchantName, itemName } = req.body || {};
+    if (!time) return res.status(400).json({ error: "缺少 time 字段" });
+    const logPath = getDreamShopLogPath(req.userKey);
+    if (!existsSync(logPath)) return res.json({ success: true, removed: 0 });
+    const records = JSON.parse(readFileSync(logPath, "utf8")) || [];
+    const before = records.length;
+    const filtered = records.filter(r => !(
+      r.time === time &&
+      (r.accountName || "") === (accountName || "") &&
+      (r.merchantName || "") === (merchantName || "") &&
+      (r.itemName || "") === (itemName || "")
+    ));
+    writeFileSync(logPath, JSON.stringify(filtered, null, 2), "utf8");
+    res.json({ success: true, removed: before - filtered.length });
+  } catch (e) {
+    console.error("[dream-shop-log] 删除失败:", e.message);
+    res.status(500).json({ error: "删除日志失败" });
+  }
+});
+
 /** 导出当前用户梦境日志 JSON（用于导入还原） */
 app.get("/api/logs/dream-shop/export-json", (req, res) => {
   try {
@@ -780,6 +808,27 @@ app.post("/api/logs/car/clear", (req, res) => {
   }
 });
 
+/** 删除单条赛车发车日志（按 time+accountName 匹配） */
+app.post("/api/logs/car/delete", (req, res) => {
+  try {
+    const { time, accountName } = req.body || {};
+    if (!time) return res.status(400).json({ error: "缺少 time 字段" });
+    const logPath = getCarLogPath(req.userKey);
+    if (!existsSync(logPath)) return res.json({ success: true, removed: 0 });
+    const records = JSON.parse(readFileSync(logPath, "utf8")) || [];
+    const before = records.length;
+    const filtered = records.filter(r => !(
+      r.time === time &&
+      (r.accountName || "") === (accountName || "")
+    ));
+    writeFileSync(logPath, JSON.stringify(filtered, null, 2), "utf8");
+    res.json({ success: true, removed: before - filtered.length });
+  } catch (e) {
+    console.error("[car-log] 删除失败:", e.message);
+    res.status(500).json({ error: "删除日志失败" });
+  }
+});
+
 /** 导出当前用户赛车日志 JSON（用于导入还原） */
 app.get("/api/logs/car/export-json", (req, res) => {
   try {
@@ -897,6 +946,57 @@ app.get("/api/control/schedules", (req, res) => {
   res.json(scheduler.getActiveSchedules());
 });
 
+/** 查询正在运行的定时任务 ID 列表 */
+app.get("/api/control/schedules/running", (req, res) => {
+  res.json({ ids: scheduler.getRunningScheduleIds() });
+});
+
+/** 停止指定定时任务当前正在执行的那一轮 */
+app.post("/api/control/schedules/:id/stop", (req, res) => {
+  try {
+    scheduler.stopSchedule(req.params.id);
+    res.json({ success: true, message: "已发送停止信号" });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+/** 统一停止所有任务（Accounts 批量 + 定时 cron + 定时立即执行） */
+app.post("/api/control/stop-all", (req, res) => {
+  try {
+    const stoppedSchedules = scheduler.stopAllRunning();
+    const stoppedBatches = batchEngine.abortAll();
+    // 收集所有相关账号，统一断开连接 + 设 abort 标志
+    const accountIds = new Set(batchEngine.getActiveAccountIds());
+    for (const { id } of stoppedSchedules) {
+      const schedule = db.getAllSchedules().find(s => String(s.id) === String(id));
+      if (schedule) {
+        const ids = schedule.account_ids === "*"
+          ? db.getAllAccounts().map(a => a.id)
+          : (schedule.account_ids || "").split(",").map(s => s.trim()).filter(Boolean);
+        for (const aid of ids) accountIds.add(aid);
+      }
+    }
+    for (const aid of accountIds) {
+      try {
+        pool.abortAccount(aid);
+        pool.allowAutoConnect(aid, false);
+        pool.disconnect(aid, true).catch(() => {});
+      } catch {}
+    }
+    const total = stoppedSchedules.length + stoppedBatches.length;
+    res.json({
+      success: true,
+      stoppedSchedules,
+      batchStopped: stoppedBatches.length,
+      message: `已停止 ${total} 个任务（定时 ${stoppedSchedules.length} + 批量 ${stoppedBatches.length}）`,
+    });
+  } catch (e) {
+    console.error("[stop-all] error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ======== 仪表盘 ========
 
 /** 仪表盘总览 */
@@ -993,7 +1093,14 @@ app.post("/api/control/disconnect-all", (req, res) => {
   res.json({ success: true });
 });
 
-/** 一键执行指定账号列表的每日任务（用 batchEngine 跟踪状态，但不走 batchEngine.run 以避免与 taskRunner 的槽位管理冲突） */
+/** 一键执行指定账号列表的每日任务（分批模式 + 限流断点续跑）
+ *
+ * 改造后（参考 xyzw）：
+ * - 使用 batchEngine.run 的分批执行机制（批内并发、批间 batchDelay）
+ * - taskRunner 返回 hasRateLimitError 时收集到限流队列
+ * - 第一轮 + 失败重试轮全部跑完后，对限流账号统一等待 rateLimitRetryDelay 再断点续跑
+ * - 限流重试最多 maxRateLimitRetry 次
+ */
 app.post("/api/control/run-daily-batch", async (req, res) => {
   const { accountIds, settings } = req.body || {};
   if (!accountIds || !Array.isArray(accountIds) || !accountIds.length) {
@@ -1008,47 +1115,118 @@ app.post("/api/control/run-daily-batch", async (req, res) => {
     userKey: req.userKey,
     onLog: (entry) => addLog({ ...entry }),
   });
-  const run = batchEngine.runs.get(runId);
 
-  res.json({ success: true, message: `开始执行 ${accounts.length} 个账号的每日任务`, runId });
-  addLog({ message: `批量每日任务(选中): ${accounts.length} 个账号`, level: "info" });
+  // 读取用户 batchSettings
+  const batchSettings = db.getUserSetting(req.userKey, "batchSettings") || {};
+  const maxActive = Math.max(1, Number(batchSettings.maxActive) || 2);
 
-  // 后台异步执行（串行，taskRunner.run 自行管理槽位/连接）
-  (async () => {
-    for (const account of accounts) {
-      if (run.aborted) {
-        run.status.set(account.id, "cancelled");
-        continue;
+  res.json({ success: true, message: `开始执行 ${accounts.length} 个账号的每日任务（并发 ${maxActive}）`, runId });
+  addLog({ message: `批量每日任务(选中): ${accounts.length} 个账号，并发 ${maxActive}`, level: "info" });
+
+  // 限流断点续跑队列：{ accountId, accountName, resumeTaskName }[]
+  let rateLimitQueue = [];
+
+  // 自定义单账号执行函数（taskRunner 内部管理槽位，所以 executeOne 不传给 batchEngine 的默认槽位逻辑）
+  const executeOne = async (accountId, logCb, accountName) => {
+    const account = accounts.find(a => a.id === accountId);
+    const name = accountName || account?.role_name || account?.name || accountId;
+    try {
+      const runner = new TaskRunner(pool);
+      const result = await runner.run(accountId, {
+        onLog: (entry) => {
+          const msg = `[${name}] ${entry.message}`;
+          addLog({ ...entry, accountId, message: msg });
+          db.addLog(accountId, account?.name || accountId, "批量每日任务", entry.message, entry.type || "info", req.userKey);
+        },
+        onDailyPointUpdate: (aid, point, max) => {
+          addLog({ accountId: aid, message: `__DAILY_POINT_UPDATE__:${point}/${max}`, type: "info" });
+        },
+      }, withGlobalDelay(settings || null));
+
+      // 限流检测：taskRunner.run 返回 hasRateLimitError 时收集到队列
+      if (result && result.hasRateLimitError) {
+        rateLimitQueue.push({
+          accountId,
+          accountName: name,
+          resumeTaskName: result.resumeTaskName,
+        });
       }
-      const accountId = account.id;
-      const accountName = account.role_name || account.name;
-      run.status.set(accountId, "running");
-      try {
-        await taskRunner.run(accountId, {
-          onLog: (entry) => {
-            const msg = `[${accountName}] ${entry.message}`;
-            addLog({ ...entry, accountId, message: msg });
-            db.addLog(accountId, account.name, "批量每日任务", entry.message, entry.type || "info", req.userKey);
-            run.logs.push({ time: new Date().toISOString(), accountId, message: msg, type: entry.type || "info" });
-          },
-        }, withGlobalDelay(settings || null));
-        run.status.set(accountId, "completed");
-        addLog({ message: `[${accountName}] 每日任务完成`, level: "success" });
-      } catch (error) {
-        run.status.set(accountId, "failed");
-        addLog({ message: `[${accountName}] 每日任务失败: ${error.message}`, level: "error" });
-        db.addLog(accountId, account.name, "批量每日任务", "error", error.message, req.userKey);
-      }
-      await new Promise(r => setTimeout(r, 3000));
+    } catch (error) {
+      throw error; // 交给 batchEngine 标记 failed 并触发重试机制
     }
-    run.completedAt = new Date();
-  })().catch((err) => {
+  };
+
+  // 第一轮执行（batchEngine 内部含分批 + 失败账号重试）
+  batchEngine.run(runId, { executeOne }).then(async () => {
+    // ===== 限流断点续跑 =====
+    const rateLimitRetryDelay = Math.max(1000, Number(batchSettings.rateLimitRetryDelay) || 60000);
+    const maxRateLimitRetry = Math.max(0, Number(batchSettings.maxRateLimitRetry) || 3);
+
+    for (let retryIdx = 0; retryIdx < maxRateLimitRetry && rateLimitQueue.length > 0; retryIdx++) {
+      const run = batchEngine.runs.get(runId);
+      if (!run || run.aborted) break;
+
+      addLog({ message: `检测到 ${rateLimitQueue.length} 个账号限流，等待 ${rateLimitRetryDelay / 1000} 秒后断点续跑（第 ${retryIdx + 1}/${maxRateLimitRetry} 次）`, level: "warning" });
+      await new Promise(r => setTimeout(r, rateLimitRetryDelay));
+
+      if (!run || run.aborted) break;
+
+      // 收集当前轮的限流账号，准备下一轮检测
+      const currentQueue = [...rateLimitQueue];
+      rateLimitQueue = [];
+
+      // 重置这些账号状态为 waiting
+      for (const item of currentQueue) {
+        run.status.set(item.accountId, "waiting");
+      }
+
+      // 串行断点续跑（避免并发再次触发限流）
+      for (const item of currentQueue) {
+        if (run.aborted) break;
+        const account = accounts.find(a => a.id === item.accountId);
+        const name = item.accountName;
+        run.status.set(item.accountId, "running");
+
+        try {
+          const runner = new TaskRunner(pool);
+          const result = await runner.run(item.accountId, {
+            onLog: (entry) => {
+              const msg = `[${name}] ${entry.message}`;
+              addLog({ ...entry, accountId: item.accountId, message: msg });
+              db.addLog(item.accountId, account?.name || item.accountId, "批量每日任务", entry.message, entry.type || "info", req.userKey);
+            },
+            onDailyPointUpdate: (aid, point, max) => {
+              addLog({ accountId: aid, message: `__DAILY_POINT_UPDATE__:${point}/${max}`, type: "info" });
+            },
+          }, withGlobalDelay(settings || null), { resumeFromTaskName: item.resumeTaskName });
+
+          if (result && result.hasRateLimitError) {
+            rateLimitQueue.push({
+              accountId: item.accountId,
+              accountName: name,
+              resumeTaskName: result.resumeTaskName || item.resumeTaskName,
+            });
+            run.status.set(item.accountId, "failed");
+          } else {
+            run.status.set(item.accountId, "completed");
+            addLog({ message: `[${name}] 每日任务完成（断点续跑成功）`, level: "success" });
+          }
+        } catch (error) {
+          run.status.set(item.accountId, "failed");
+          addLog({ message: `[${name}] 断点续跑失败: ${error.message}`, level: "error" });
+        }
+      }
+    }
+
+    if (rateLimitQueue.length > 0) {
+      addLog({ message: `${rateLimitQueue.length} 个账号限流重试后仍未完成`, level: "error" });
+    }
+  }).catch((err) => {
     console.error("[run-daily-batch] failed:", err);
-    run.completedAt = new Date();
   });
 });
 
-/** 一键执行所有已连接账号的每日任务 */
+/** 一键执行所有已连接账号的每日任务（复用 run-daily-batch 的分批 + 限流断点续跑逻辑） */
 app.post("/api/control/run-daily-all", async (req, res) => {
   const accounts = db.getAllAccounts(req.userKey);
   const statuses = pool.getAllStatus();
@@ -1059,26 +1237,111 @@ app.post("/api/control/run-daily-all", async (req, res) => {
   }
 
   const customSettings = req.body?.settings || null;
-  res.json({ success: true, message: `开始执行 ${connected.length} 个账号的每日任务` });
+  const ids = connected.map(a => a.id);
+  const runId = batchEngine.createRun("daily", ids, req.body || {}, {
+    userKey: req.userKey,
+    onLog: (entry) => addLog({ ...entry }),
+  });
 
-  addLog({ message: `批量每日任务: ${connected.length} 个账号`, level: "info" });
+  const batchSettings = db.getUserSetting(req.userKey, "batchSettings") || {};
+  const maxActive = Math.max(1, Number(batchSettings.maxActive) || 2);
 
-  for (const account of connected) {
-    const accountName = account.role_name || account.name;
+  res.json({ success: true, message: `开始执行 ${connected.length} 个账号的每日任务（并发 ${maxActive}）`, runId });
+  addLog({ message: `批量每日任务: ${connected.length} 个账号，并发 ${maxActive}`, level: "info" });
+
+  let rateLimitQueue = [];
+
+  const executeOne = async (accountId, logCb, accountName) => {
+    const account = connected.find(a => a.id === accountId);
+    const name = accountName || account?.role_name || account?.name || accountId;
     try {
-      await taskRunner.run(account.id, {
+      const runner = new TaskRunner(pool);
+      const result = await runner.run(accountId, {
         onLog: (entry) => {
-          addLog({ ...entry, accountId: account.id, message: `[${accountName}] ${entry.message}` });
-          db.addLog(account.id, account.name, "批量每日任务", entry.message, entry.type || "info", req.userKey);
+          const msg = `[${name}] ${entry.message}`;
+          addLog({ ...entry, accountId, message: msg });
+          db.addLog(accountId, account?.name || accountId, "批量每日任务", entry.message, entry.type || "info", req.userKey);
+        },
+        onDailyPointUpdate: (aid, point, max) => {
+          addLog({ accountId: aid, message: `__DAILY_POINT_UPDATE__:${point}/${max}`, type: "info" });
         },
       }, withGlobalDelay(customSettings));
-      addLog({ message: `[${accountName}] 每日任务完成`, level: "success" });
+
+      if (result && result.hasRateLimitError) {
+        rateLimitQueue.push({
+          accountId,
+          accountName: name,
+          resumeTaskName: result.resumeTaskName,
+        });
+      }
     } catch (error) {
-      addLog({ message: `[${accountName}] 每日任务失败: ${error.message}`, level: "error" });
-      db.addLog(account.id, account.name, "批量每日任务", "error", error.message, req.userKey);
+      throw error;
     }
-    await new Promise(r => setTimeout(r, 3000));
-  }
+  };
+
+  batchEngine.run(runId, { executeOne }).then(async () => {
+    const rateLimitRetryDelay = Math.max(1000, Number(batchSettings.rateLimitRetryDelay) || 60000);
+    const maxRateLimitRetry = Math.max(0, Number(batchSettings.maxRateLimitRetry) || 3);
+
+    for (let retryIdx = 0; retryIdx < maxRateLimitRetry && rateLimitQueue.length > 0; retryIdx++) {
+      const run = batchEngine.runs.get(runId);
+      if (!run || run.aborted) break;
+
+      addLog({ message: `检测到 ${rateLimitQueue.length} 个账号限流，等待 ${rateLimitRetryDelay / 1000} 秒后断点续跑（第 ${retryIdx + 1}/${maxRateLimitRetry} 次）`, level: "warning" });
+      await new Promise(r => setTimeout(r, rateLimitRetryDelay));
+
+      if (!run || run.aborted) break;
+
+      const currentQueue = [...rateLimitQueue];
+      rateLimitQueue = [];
+
+      for (const item of currentQueue) {
+        run.status.set(item.accountId, "waiting");
+      }
+
+      for (const item of currentQueue) {
+        if (run.aborted) break;
+        const account = connected.find(a => a.id === item.accountId);
+        const name = item.accountName;
+        run.status.set(item.accountId, "running");
+
+        try {
+          const runner = new TaskRunner(pool);
+          const result = await runner.run(item.accountId, {
+            onLog: (entry) => {
+              const msg = `[${name}] ${entry.message}`;
+              addLog({ ...entry, accountId: item.accountId, message: msg });
+              db.addLog(item.accountId, account?.name || item.accountId, "批量每日任务", entry.message, entry.type || "info", req.userKey);
+            },
+            onDailyPointUpdate: (aid, point, max) => {
+              addLog({ accountId: aid, message: `__DAILY_POINT_UPDATE__:${point}/${max}`, type: "info" });
+            },
+          }, withGlobalDelay(customSettings), { resumeFromTaskName: item.resumeTaskName });
+
+          if (result && result.hasRateLimitError) {
+            rateLimitQueue.push({
+              accountId: item.accountId,
+              accountName: name,
+              resumeTaskName: result.resumeTaskName || item.resumeTaskName,
+            });
+            run.status.set(item.accountId, "failed");
+          } else {
+            run.status.set(item.accountId, "completed");
+            addLog({ message: `[${name}] 每日任务完成（断点续跑成功）`, level: "success" });
+          }
+        } catch (error) {
+          run.status.set(item.accountId, "failed");
+          addLog({ message: `[${name}] 断点续跑失败: ${error.message}`, level: "error" });
+        }
+      }
+    }
+
+    if (rateLimitQueue.length > 0) {
+      addLog({ message: `${rateLimitQueue.length} 个账号限流重试后仍未完成`, level: "error" });
+    }
+  }).catch((err) => {
+    console.error("[run-daily-all] failed:", err);
+  });
 });
 
 // ======== 批量功能 API ========
@@ -1237,6 +1500,19 @@ app.post("/api/batch/:operation/:id", async (req, res) => {
 /** 中止批量运行 */
 app.post("/api/batch/abort/:runId", (req, res) => {
   const ok = batchEngine.abort(req.params.runId);
+  if (ok) {
+    // 同时中止该 run 下所有账号：设标志 + 主动断开连接（让 taskRunner/batch 模块尽快退出）
+    const run = batchEngine.runs.get(req.params.runId);
+    if (run) {
+      for (const aid of run.accountIds) {
+        try {
+          pool.abortAccount(aid);
+          pool.allowAutoConnect(aid, false);
+          pool.disconnect(aid, true).catch(() => {});
+        } catch {}
+      }
+    }
+  }
   res.json({ success: ok, message: ok ? "已发送中止信号" : "运行不存在或已结束" });
 });
 

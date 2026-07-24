@@ -185,8 +185,6 @@ export class CarTasks {
       ),
     };
     const assignHelperEnabled = options.assignHelper !== false;
-    const delayAction = Number(options.delay?.action ?? options.actionDelay ?? 300);
-    const delayRefresh = Number(options.delay?.refresh ?? options.refreshDelay ?? 1000);
 
     log(`=== 智能发车 ===`);
     await this.pool.ensureConnected(accountId);
@@ -255,7 +253,6 @@ export class CarTasks {
             });
             sentCount++;
             pushSentCar(car);
-            await new Promise((r) => setTimeout(r, delayAction));
             continue;
           }
 
@@ -279,7 +276,6 @@ export class CarTasks {
             });
             sentCount++;
             pushSentCar(car);
-            await new Promise((r) => setTimeout(r, delayAction));
             continue;
           }
 
@@ -320,7 +316,6 @@ export class CarTasks {
               });
               sentCount++;
               pushSentCar(car);
-              await new Promise((r) => setTimeout(r, delayAction));
               break;
             }
 
@@ -350,11 +345,9 @@ export class CarTasks {
               });
               sentCount++;
               pushSentCar(car);
-              await new Promise((r) => setTimeout(r, delayAction));
               break;
             }
 
-            await new Promise((r) => setTimeout(r, delayRefresh));
           }
         } catch (carErr) {
           log(`车辆处理失败: ${carErr.message}，跳过`, "error");

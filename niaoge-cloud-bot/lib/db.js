@@ -384,14 +384,23 @@ function backupDatabase() {
 
 /**
  * 将数据库写入磁盘（sql.js 是内存数据库，需要手动保存）
+ * 备份降频：每 5 分钟最多一次全量备份，避免批量任务期间同步IO阻塞事件循环
  */
+let lastBackupTime = 0;
+const BACKUP_INTERVAL_MS = 5 * 60 * 1000; // 5分钟
+
 function saveToDisk() {
   if (!db) return;
   try {
     const data = db.export();
     const buf = Buffer.from(data);
     writeFileSync(DB_PATH, buf);
-    backupDatabase();
+    // 备份降频：只在距上次备份超过 5 分钟时才执行
+    const now = Date.now();
+    if (now - lastBackupTime >= BACKUP_INTERVAL_MS) {
+      lastBackupTime = now;
+      backupDatabase();
+    }
   } catch (e) {
     console.error("保存数据库失败:", e.message);
   }
@@ -399,11 +408,24 @@ function saveToDisk() {
 
 /**
  * 自动保存（每次写操作后延迟保存，减少 IO）
+ * 防抖 + 最大等待：2秒内无新操作则保存，但最多10秒一定保存一次
+ * 避免批量任务期间持续写操作导致 saveToDisk 永远不执行
  */
 let saveTimer = null;
+let maxWaitTimer = null;
 function autoSave() {
   if (saveTimer) clearTimeout(saveTimer);
-  saveTimer = setTimeout(saveToDisk, 2000);
+  saveTimer = setTimeout(() => {
+    if (maxWaitTimer) { clearTimeout(maxWaitTimer); maxWaitTimer = null; }
+    saveToDisk();
+  }, 2000);
+  if (!maxWaitTimer) {
+    maxWaitTimer = setTimeout(() => {
+      if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+      saveToDisk();
+      maxWaitTimer = null;
+    }, 10000);
+  }
 }
 
 // ======== 辅助：sql.js 查询结果转换 ========
@@ -518,8 +540,8 @@ export function updateAccount(id, data, userKey) {
   } else {
     exec(`UPDATE accounts SET ${fields.join(', ')} WHERE id = ?`, values);
   }
-  // 立即写入磁盘（关键数据的更新需要即时持久化）
-  saveToDisk();
+  // 走防抖保存（2秒内合并多次写入），避免批量任务期间频繁同步IO阻塞事件循环
+  autoSave();
 }
 
 export function removeAccount(id, userKey) {

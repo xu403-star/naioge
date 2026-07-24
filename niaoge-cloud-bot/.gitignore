@@ -5,7 +5,12 @@ node_modules/
 data/cloud-bot.db
 data/cloud-bot.db-journal
 data/cloud-bot.db-wal
+data/cloud-bot.db.bak*
 data/backups/
+data.db
+*.db
+*.db-journal
+*.db-wal
 
 # 运行时日志数据（按用户隔离，7天有效期）
 data/car-log/

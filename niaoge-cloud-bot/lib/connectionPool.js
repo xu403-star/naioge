@@ -147,6 +147,15 @@ export class ConnectionPool {
   }
 
   /**
+   * 获取账号连接初始化时缓存的角色信息（避免 taskRunner 重复请求 role_getroleinfo）
+   * @returns {object|null} roleInfo 或 null（未连接或初始化时未获取到）
+   */
+  getCachedRoleInfo(accountId) {
+    const conn = this.connections.get(accountId);
+    return conn?.lastRoleInfo || null;
+  }
+
+  /**
    * 获取连接状态
    */
   getStatus(accountId) {
@@ -273,7 +282,7 @@ export class ConnectionPool {
     });
     const clientRef = client;
 
-    const connEntry = { client, status: "connecting", hasSlot: true, roleName: "" };
+    const connEntry = { client, status: "connecting", hasSlot: true, roleName: "", lastRoleInfo: null };
     this.connections.set(accountId, connEntry);
 
     // 把本次连接实际使用的 token/wsUrl 保存到闭包，供回调使用
@@ -345,11 +354,12 @@ export class ConnectionPool {
           const roleInfo = await client.sendWithPromise("role_getroleinfo", {}, 8000);
           this.log(`[${name}] 角色信息获取成功`);
 
-          // 缓存真实角色名，供后续日志统一使用
+          // 缓存真实角色名和完整角色信息，供后续日志和 taskRunner 复用（避免重复请求 role_getroleinfo）
           const roleName = roleInfo?.role?.name || roleInfo?.name || "";
           if (roleName) {
             connEntry.roleName = roleName;
           }
+          connEntry.lastRoleInfo = roleInfo;
 
           // 更新角色信息到数据库
           if (roleInfo) {

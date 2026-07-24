@@ -6,6 +6,7 @@
       :batch-settings="batchSettings"
       @update:count="scheduleCount = $event"
       @refresh="loadStats"
+      @stop-all="onStopAllFromSchedule"
     />
 
     <!-- 顶部统计 -->
@@ -113,7 +114,7 @@
               <button class="btn btn-outline btn-sm" @click="batchRefreshTokens" :disabled="refreshingTokens">刷新Token</button>
               <button class="btn btn-outline btn-sm" style="color:var(--danger)" @click="batchDelete">删除</button>
               <button class="btn btn-primary btn-sm" @click="batchDaily">每日</button>
-              <button v-if="running" class="btn btn-danger btn-sm" @click="abortBatch">停止</button>
+              <button class="btn btn-danger btn-sm" @click="abortBatch" :disabled="!running">停止</button>
             </div>
           </div>
 
@@ -122,6 +123,7 @@
             <span style="color: var(--success)">{{ runStatus.summary?.completed || 0 }} 完成</span> /
             <span style="color: var(--danger)">{{ runStatus.summary?.failed || 0 }} 失败</span> /
             <span>{{ runStatus.summary?.running || 0 }} 执行中</span>
+            <span v-if="(runStatus.summary?.waiting || 0) > 0" style="color: var(--warning)"> / {{ runStatus.summary.waiting }} 等待重试</span>
           </div>
 
           <div class="tab-bar">
@@ -179,17 +181,28 @@
             <label v-if="isAdmin" class="admin-toggle-inline">
               <input v-model="dreamShopAllUsers" type="checkbox" /> 全部用户
             </label>
+            <button class="btn btn-xs btn-outline" style="color:var(--danger)" @click="clearDreamShopLogs" :disabled="dreamShopAllUsers">全部清空</button>
+            <button class="btn btn-xs btn-outline" style="color:var(--danger)" @click="batchDeleteDreamShop" :disabled="dreamShopSelected.size === 0 || dreamShopAllUsers">批量删除({{ dreamShopSelected.size }})</button>
             <button class="btn btn-xs btn-outline" @click="closeDreamShopModal">关闭</button>
           </div>
         </div>
         <div class="modal-body">
+          <div class="log-filter-bar">
+            <label class="log-filter-label">按日期筛选
+              <input v-model="dreamShopFilterDate" type="date" class="log-date-input" />
+            </label>
+            <button v-if="dreamShopFilterDate" class="btn btn-xs btn-outline" @click="dreamShopFilterDate = ''">清除筛选</button>
+          </div>
           <div v-if="dreamShopLoading" class="text-center text-muted" style="padding:30px">加载中...</div>
-          <div v-else-if="dreamShopLogs.length === 0" class="text-center text-muted" style="padding:30px">暂无梦境购买记录</div>
+          <div v-else-if="dreamShopGroupedEmpty" class="text-center text-muted" style="padding:30px">{{ dreamShopFilterDate ? '该日期无记录' : '暂无梦境购买记录' }}</div>
           <div v-else>
             <div v-for="(group, date) in dreamShopGrouped" :key="date" style="margin-bottom:12px">
               <div style="font-size:12px;color:var(--text-muted);margin-bottom:6px;padding-left:4px">{{ date }}</div>
               <div v-for="(log, i) in group" :key="i" class="log-modal-card">
                 <div class="log-modal-time">
+                  <label class="log-check" v-if="!dreamShopAllUsers">
+                    <input type="checkbox" :checked="dreamShopSelected.has(getDreamShopLogKey(log))" @change="toggleDreamShopLog(log)" />
+                  </label>
                   {{ formatTime(log.time) }}
                   <span v-if="dreamShopAllUsers" class="user-tag">{{ log.userKey }}</span>
                 </div>
@@ -199,6 +212,7 @@
                   <span>{{ log.merchantName }}</span>
                   <span style="color:var(--text-muted)"> · </span>
                   <span style="color:var(--success);font-weight:500">{{ log.itemName }}</span>
+                  <button class="log-del-btn" @click="deleteDreamShopLog(log)" title="删除此条">删除</button>
                 </div>
               </div>
             </div>
@@ -223,17 +237,28 @@
             <label v-if="isAdmin" class="admin-toggle-inline">
               <input v-model="carLogAllUsers" type="checkbox" /> 全部用户
             </label>
+            <button class="btn btn-xs btn-outline" style="color:var(--danger)" @click="clearCarLogs" :disabled="carLogAllUsers">全部清空</button>
+            <button class="btn btn-xs btn-outline" style="color:var(--danger)" @click="batchDeleteCarLog" :disabled="carLogSelected.size === 0 || carLogAllUsers">批量删除({{ carLogSelected.size }})</button>
             <button class="btn btn-xs btn-outline" @click="closeCarLogModal">关闭</button>
           </div>
         </div>
         <div class="modal-body">
+          <div class="log-filter-bar">
+            <label class="log-filter-label">按日期筛选
+              <input v-model="carLogFilterDate" type="date" class="log-date-input" />
+            </label>
+            <button v-if="carLogFilterDate" class="btn btn-xs btn-outline" @click="carLogFilterDate = ''">清除筛选</button>
+          </div>
           <div v-if="carLogLoading" class="text-center text-muted" style="padding:30px">加载中...</div>
-          <div v-else-if="carLogs.length === 0" class="text-center text-muted" style="padding:30px">暂无赛车发车记录</div>
+          <div v-else-if="carLogGroupedEmpty" class="text-center text-muted" style="padding:30px">{{ carLogFilterDate ? '该日期无记录' : '暂无赛车发车记录' }}</div>
           <div v-else>
             <div v-for="(group, date) in carLogGrouped" :key="date" style="margin-bottom:12px">
               <div style="font-size:12px;color:var(--text-muted);margin-bottom:6px;padding-left:4px">{{ date }}</div>
               <div v-for="(log, i) in group" :key="i" class="log-modal-card car">
                 <div class="log-modal-time">
+                  <label class="log-check" v-if="!carLogAllUsers">
+                    <input type="checkbox" :checked="carLogSelected.has(getCarLogKey(log))" @change="toggleCarLog(log)" />
+                  </label>
                   {{ formatTime(log.time) }}
                   <span v-if="carLogAllUsers" class="user-tag">{{ log.userKey }}</span>
                 </div>
@@ -241,6 +266,7 @@
                   <span style="font-weight:600">{{ log.accountName }}</span>
                   <span style="color:var(--text-muted)"> · </span>
                   <span style="color:var(--primary)">发车 {{ log.sentCount }} 辆</span>
+                  <button class="log-del-btn" @click="deleteCarLog(log)" title="删除此条">删除</button>
                 </div>
                 <div v-if="log.cars && log.cars.length" class="log-modal-cars">
                   <span v-for="(c, idx) in log.cars" :key="idx" class="car-chip" :class="'car-color-' + c.color">
@@ -276,6 +302,12 @@
               <div class="input-group">
                 <label>最大并发账号数</label>
                 <input type="number" v-model.number="batchSettings.maxActive" min="1" max="10" />
+                <small>每批同时执行的账号数</small>
+              </div>
+              <div class="input-group">
+                <label>批间间隔 (毫秒)</label>
+                <input v-model.number="batchSettings.batchDelay" type="number" min="0" step="500" />
+                <small>一批账号跑完后等待多久再启动下一批，避免连环触发限流</small>
               </div>
               <div class="input-group">
                 <label>最大日志条数</label>
@@ -283,31 +315,45 @@
               </div>
             </div>
 
-            <div class="settings-section-title">通用延迟（毫秒）</div>
+            <div class="settings-section-title">全局延迟设置</div>
             <div class="settings-grid">
               <div class="input-group">
-                <label>指令延迟</label>
-                <input type="number" v-model.number="batchSettings.commandDelay" min="0" />
+                <label>指令延迟 (毫秒)</label>
+                <input v-model.number="batchSettings.commandDelay" type="number" min="0" step="100" />
+                <small>每条游戏命令成功后的等待，影响全部功能（每日任务、批量任务、智能发车等）</small>
               </div>
               <div class="input-group">
-                <label>任务间延迟</label>
-                <input type="number" v-model.number="batchSettings.taskDelay" min="0" />
+                <label>任务间延迟 (毫秒)</label>
+                <input v-model.number="batchSettings.taskDelay" type="number" min="0" step="100" />
+                <small>每日任务中每个小任务之间的等待（仅每日任务生效）</small>
+              </div>
+            </div>
+
+            <div class="settings-section-title">失败重试（普通批量操作）</div>
+            <div class="settings-grid">
+              <div class="input-group">
+                <label>最大重试次数</label>
+                <input v-model.number="batchSettings.maxRetry" type="number" min="0" max="5" />
+                <small>失败账号的重试轮数（开箱/钓鱼/爬塔等普通批量操作）</small>
               </div>
               <div class="input-group">
-                <label>动作延迟</label>
-                <input type="number" v-model.number="batchSettings.actionDelay" min="0" />
+                <label>重试间隔 (毫秒)</label>
+                <input v-model.number="batchSettings.retryDelay" type="number" min="0" step="1000" />
+                <small>重试开始前的等待时间</small>
+              </div>
+            </div>
+
+            <div class="settings-section-title">限流断点续跑（每日任务）</div>
+            <div class="settings-grid">
+              <div class="input-group">
+                <label>限流等待 (秒)</label>
+                <input v-model.number="batchSettings.rateLimitRetryDelay" type="number" min="10" step="10" />
+                <small>遇到 400340/200750 限流时统一等待的秒数，到点后从断点继续</small>
               </div>
               <div class="input-group">
-                <label>战斗延迟</label>
-                <input type="number" v-model.number="batchSettings.battleDelay" min="0" />
-              </div>
-              <div class="input-group">
-                <label>刷新延迟</label>
-                <input type="number" v-model.number="batchSettings.refreshDelay" min="0" />
-              </div>
-              <div class="input-group">
-                <label>长等待延迟</label>
-                <input type="number" v-model.number="batchSettings.longDelay" min="0" />
+                <label>限流重试次数</label>
+                <input v-model.number="batchSettings.maxRateLimitRetry" type="number" min="0" max="10" />
+                <small>最多断点续跑的次数</small>
               </div>
             </div>
 
@@ -613,15 +659,25 @@ const showCarLogModal = ref(false)
 const carLogs = ref([])
 const carLogLoading = ref(false)
 const carLogAllUsers = ref(false)
+const dreamShopFilterDate = ref('')  // 梦境日志日期筛选（空=全部）
+const carLogFilterDate = ref('')      // 赛车日志日期筛选（空=全部）
+const dreamShopSelected = ref(new Set())  // 梦境日志勾选的记录 key
+const carLogSelected = ref(new Set())      // 赛车日志勾选的记录 key
 
 const DEFAULT_BATCH_SETTINGS = {
   maxActive: 2,
   commandDelay: 500,
   taskDelay: 500,
-  actionDelay: 300,
-  battleDelay: 500,
-  refreshDelay: 1000,
-  longDelay: 3000,
+  // 批次间间隔（一批账号跑完后等待多久再启动下一批，避免账号多时连环触发限流）
+  batchDelay: 1000,
+  // 失败账号重试间隔（第一轮跑完后，失败账号等待多久再重试）
+  retryDelay: 3000,
+  // 失败账号最大重试次数（仅普通批量操作生效，每日任务限流走 rateLimitRetryDelay）
+  maxRetry: 1,
+  // 限流（400340/200750/11800010）断点续跑等待间隔（秒）
+  rateLimitRetryDelay: 60,
+  // 限流断点续跑最大重试次数
+  maxRateLimitRetry: 3,
   boxCount: 100,
   fishCount: 100,
   recruitCount: 10,
@@ -938,7 +994,12 @@ async function loadAccounts() {
 async function loadBatchSettings() {
   try {
     const saved = await api.get('/api/settings/batch')
-    batchSettings.value = { ...DEFAULT_BATCH_SETTINGS, ...(saved || {}) }
+    const merged = { ...DEFAULT_BATCH_SETTINGS, ...(saved || {}) }
+    // rateLimitRetryDelay 后端用毫秒，前端用秒，加载时转换
+    if (merged.rateLimitRetryDelay && merged.rateLimitRetryDelay >= 1000) {
+      merged.rateLimitRetryDelay = Math.round(merged.rateLimitRetryDelay / 1000)
+    }
+    batchSettings.value = merged
   } catch {
     batchSettings.value = { ...DEFAULT_BATCH_SETTINGS }
   }
@@ -1169,32 +1230,13 @@ async function runDaily(acc) {
 }
 
 async function waitDailyCompleteAndRefresh(id) {
-  // 任务执行期间监听后端推送的活跃度更新和日志完成标志
+  // 任务执行期间轮询日志检测完成标志，完成后读取最终活跃度快照
   for (let i = 0; i < 60; i++) {
     await new Promise(r => setTimeout(r, 3000))
     try {
       const serverLogs = await api.get('/api/control/logs?limit=200')
 
-      // 1. 解析活跃度实时推送（取最新一条）
-      const updateLogs = serverLogs.filter(l =>
-        l.accountId === id && l.message?.startsWith('__DAILY_POINT_UPDATE__:')
-      )
-      const updateLog = updateLogs[updateLogs.length - 1]
-      if (updateLog) {
-        const match = updateLog.message.match(/:(\d+)\/(\d+)/)
-        if (match) {
-          const point = parseInt(match[1], 10)
-          const max = parseInt(match[2], 10)
-          accountStatusMap[id] = {
-            ...(accountStatusMap[id] || {}),
-            dailyPoint: point,
-            dailyPointMax: max,
-            pending: true
-          }
-        }
-      }
-
-      // 2. 检测完成标志
+      // 检测完成标志
       const completed = serverLogs.some(l =>
         l.accountId === id && /手动每日任务完成|所有任务执行完成|每日任务完成/.test(l.message)
       )
@@ -1375,22 +1417,38 @@ function formatDateLabel(iso) {
 const dreamShopGrouped = computed(() => {
   const map = {}
   for (const log of dreamShopLogs.value) {
+    if (dreamShopFilterDate.value) {
+      const d = new Date(log.time)
+      const y = d.getFullYear()
+      const m = String(d.getMonth() + 1).padStart(2, '0')
+      const day = String(d.getDate()).padStart(2, '0')
+      if (`${y}-${m}-${day}` !== dreamShopFilterDate.value) continue
+    }
     const date = formatDateLabel(log.time)
     if (!map[date]) map[date] = []
     map[date].push(log)
   }
   return map
 })
+const dreamShopGroupedEmpty = computed(() => Object.keys(dreamShopGrouped.value).length === 0)
 
 const carLogGrouped = computed(() => {
   const map = {}
   for (const log of carLogs.value) {
+    if (carLogFilterDate.value) {
+      const d = new Date(log.time)
+      const y = d.getFullYear()
+      const m = String(d.getMonth() + 1).padStart(2, '0')
+      const day = String(d.getDate()).padStart(2, '0')
+      if (`${y}-${m}-${day}` !== carLogFilterDate.value) continue
+    }
     const date = formatDateLabel(log.time)
     if (!map[date]) map[date] = []
     map[date].push(log)
   }
   return map
 })
+const carLogGroupedEmpty = computed(() => Object.keys(carLogGrouped.value).length === 0)
 
 async function loadCurrentUser() {
   try {
@@ -1406,6 +1464,8 @@ async function loadCurrentUser() {
 
 function openDreamShopModal() {
   showDreamShopModal.value = true
+  dreamShopFilterDate.value = ''
+  dreamShopSelected.value = new Set()
   loadDreamShopLogs()
 }
 
@@ -1428,6 +1488,8 @@ async function loadDreamShopLogs() {
 
 function openCarLogModal() {
   showCarLogModal.value = true
+  carLogFilterDate.value = ''
+  carLogSelected.value = new Set()
   loadCarLogs()
 }
 
@@ -1538,6 +1600,130 @@ async function importDreamShopJson(event) {
   }
 }
 
+async function deleteDreamShopLog(log) {
+  try {
+    const result = await api.post('/api/logs/dream-shop/delete', {
+      time: log.time,
+      accountName: log.accountName,
+      merchantName: log.merchantName,
+      itemName: log.itemName,
+    })
+    if (result.success) {
+      dreamShopLogs.value = dreamShopLogs.value.filter(l => !(
+        l.time === log.time &&
+        (l.accountName || '') === (log.accountName || '') &&
+        (l.merchantName || '') === (log.merchantName || '') &&
+        (l.itemName || '') === (log.itemName || '')
+      ))
+      toast.show(result.removed > 0 ? '已删除' : '未找到匹配记录')
+    } else {
+      toast.show('删除失败')
+    }
+  } catch (e) {
+    toast.show('删除失败: ' + e.message)
+  }
+}
+
+async function deleteCarLog(log) {
+  try {
+    const result = await api.post('/api/logs/car/delete', {
+      time: log.time,
+      accountName: log.accountName,
+    })
+    if (result.success) {
+      carLogs.value = carLogs.value.filter(l => !(
+        l.time === log.time &&
+        (l.accountName || '') === (log.accountName || '')
+      ))
+      toast.show(result.removed > 0 ? '已删除' : '未找到匹配记录')
+    } else {
+      toast.show('删除失败')
+    }
+  } catch (e) {
+    toast.show('删除失败: ' + e.message)
+  }
+}
+
+function getDreamShopLogKey(log) {
+  return `${log.time}|${log.accountName || ''}|${log.merchantName || ''}|${log.itemName || ''}`
+}
+
+function getCarLogKey(log) {
+  return `${log.time}|${log.accountName || ''}`
+}
+
+function toggleDreamShopLog(log) {
+  const key = getDreamShopLogKey(log)
+  const s = new Set(dreamShopSelected.value)
+  if (s.has(key)) s.delete(key)
+  else s.add(key)
+  dreamShopSelected.value = s
+}
+
+function toggleCarLog(log) {
+  const key = getCarLogKey(log)
+  const s = new Set(carLogSelected.value)
+  if (s.has(key)) s.delete(key)
+  else s.add(key)
+  carLogSelected.value = s
+}
+
+async function clearDreamShopLogs() {
+  if (!confirm('确定要清空全部梦境购买记录吗？此操作不可恢复。')) return
+  try {
+    await api.post('/api/logs/dream-shop/clear')
+    dreamShopLogs.value = []
+    dreamShopSelected.value = new Set()
+    toast.show('已清空')
+  } catch (e) {
+    toast.show('清空失败: ' + e.message)
+  }
+}
+
+async function clearCarLogs() {
+  if (!confirm('确定要清空全部赛车发车记录吗？此操作不可恢复。')) return
+  try {
+    await api.post('/api/logs/car/clear')
+    carLogs.value = []
+    carLogSelected.value = new Set()
+    toast.show('已清空')
+  } catch (e) {
+    toast.show('清空失败: ' + e.message)
+  }
+}
+
+async function batchDeleteDreamShop() {
+  if (dreamShopSelected.value.size === 0) return
+  if (!confirm(`确定删除选中的 ${dreamShopSelected.value.size} 条梦境记录吗？`)) return
+  let ok = 0
+  for (const key of dreamShopSelected.value) {
+    const [time, accountName, merchantName, itemName] = key.split('|')
+    try {
+      await api.post('/api/logs/dream-shop/delete', { time, accountName, merchantName, itemName })
+      ok++
+    } catch {}
+  }
+  dreamShopLogs.value = dreamShopLogs.value.filter(l => !dreamShopSelected.value.has(getDreamShopLogKey(l)))
+  dreamShopSelected.value = new Set()
+  toast.show(`已删除 ${ok} 条`)
+}
+
+async function batchDeleteCarLog() {
+  if (carLogSelected.value.size === 0) return
+  if (!confirm(`确定删除选中的 ${carLogSelected.value.size} 条赛车记录吗？`)) return
+  let ok = 0
+  for (const key of carLogSelected.value) {
+    const [time, accountName] = key.split('|')
+    try {
+      await api.post('/api/logs/car/delete', { time, accountName })
+      ok++
+    } catch {}
+  }
+  carLogs.value = carLogs.value.filter(l => !carLogSelected.value.has(getCarLogKey(l)))
+  carLogSelected.value = new Set()
+  toast.show(`已删除 ${ok} 条`)
+}
+
 async function importCarLogJson(event) {
   const file = event.target.files?.[0]
   if (!file) return
@@ -1578,26 +1764,25 @@ async function disconnectAll() {
 }
 
 async function batchDaily() {
+  if (running.value) return toast.show('已有批量任务在执行中')
   const ids = [...selectedIds.value]
-  const maxActive = Math.max(1, batchSettings.value.maxActive || 2)
-  addLog(`批量执行每日任务 ${ids.length} 个账号，并发 ${maxActive}`)
-  for (let i = 0; i < ids.length; i += maxActive) {
-    const batch = ids.slice(i, i + maxActive)
-    await Promise.all(batch.map(async (id) => {
-      const acc = accounts.value.find(a => a.id === id)
-      try {
-        const settings = await api.get(`/api/accounts/${id}/settings`).catch(() => ({}))
-        await api.post(`/api/control/run-daily/${id}`, { settings })
-        addLog(`[${acc?.name || id}] 每日任务已触发`, 'success')
-        if (acc) {
-          acc.status = 'connected'
-          accountStatusMap[acc.id] = { dailyPoint: 0, dailyPointMax: 100, pending: true }
-        }
-        await waitDailyCompleteAndRefresh(id)
-      } catch (e) {
-        addLog(`[${acc?.name || id}] 每日任务失败: ${e.message}`, 'error')
-      }
-    }))
+  if (ids.length === 0) return toast.show('请选择账号')
+  running.value = true
+  currentRunId.value = null
+  runStatus.value = null
+  addLog(`批量执行每日任务 ${ids.length} 个账号`)
+  for (const id of ids) {
+    accountStatusMap[id] = { ...(accountStatusMap[id] || {}), pending: true }
+  }
+  currentOperationLabel.value = '每日任务'
+  try {
+    const res = await api.post('/api/control/run-daily-batch', { accountIds: ids })
+    currentRunId.value = res.runId
+    toast.show(res.message || '已开始执行')
+    startPollingRunStatus()
+  } catch (e) {
+    addLog(`批量每日任务启动失败: ${e.message}`, 'error')
+    running.value = false
   }
 }
 
@@ -1645,6 +1830,9 @@ async function runBatch(operation, label, extraBody = {}) {
   runStatus.value = null
   addLog(`开始执行 [${label}]，共 ${ids.length} 个账号`)
   currentOperationLabel.value = label
+  for (const id of ids) {
+    accountStatusMap[id] = { ...(accountStatusMap[id] || {}), pending: true }
+  }
 
   try {
     const body = { accountIds: ids, ...extraBody }
@@ -1661,20 +1849,25 @@ async function runBatch(operation, label, extraBody = {}) {
 function startPollingRunStatus() {
   if (statusTimer) clearInterval(statusTimer)
   const carSnapshotLoaded = new Set()
+  // 防止 async setInterval 竞态：多个回调同时检测到 completedAt 导致 "全部执行完成" 重复
+  let completedHandled = false
   statusTimer = setInterval(async () => {
-    if (!currentRunId.value) {
+    if (!currentRunId.value || completedHandled) {
       clearInterval(statusTimer)
       return
     }
     try {
       const status = await api.get(`/api/batch/status/${currentRunId.value}`)
+      if (completedHandled) return
       runStatus.value = status
       await fetchRunLogs()
+      if (completedHandled) return
       if (status.status) {
         for (const id of Object.keys(status.status)) {
           if (status.status[id] === 'completed' && !carSnapshotLoaded.has(id)) {
             carSnapshotLoaded.add(id)
             await loadAccountCarSnapshot(id)
+            await loadAccountDailySnapshot(id)
           }
           if (['running', 'completed'].includes(status.status[id])) {
             const acc = accounts.value.find(a => a.id === id)
@@ -1688,13 +1881,17 @@ function startPollingRunStatus() {
         }
       }
       if (status.completedAt) {
+        // 在任何 await 之前同步设置标志，防止并发的下一个 interval 回调重复处理
+        completedHandled = true
         clearInterval(statusTimer)
         running.value = false
+        currentRunId.value = null
         await loadAccounts()
         for (const id of Object.keys(status.status || {})) {
           if (!carSnapshotLoaded.has(id)) {
             await loadAccountCarSnapshot(id)
           }
+          await loadAccountDailySnapshot(id)
         }
         addLog(`[${currentOperationLabel.value || '批量任务'}] 全部执行完成`, 'success')
       }
@@ -1730,13 +1927,25 @@ async function fetchRunLogs() {
 }
 
 async function abortBatch() {
-  if (!currentRunId.value) return
   try {
-    await api.post(`/api/batch/abort/${currentRunId.value}`)
-    toast.show('已发送停止信号')
+    const res = await api.post('/api/control/stop-all', null, { timeout: 60000 })
+    toast.show(res.message || '已停止所有任务')
   } catch (e) {
-    toast.show('停止失败: ' + e.message)
+    toast.show('停止失败: ' + e.message + '（已重置前端状态，如后端无响应请重启后端）')
+  } finally {
+    // 无论成功失败都重置前端状态，避免按钮卡住无法操作
+    running.value = false
+    currentRunId.value = null
+    if (statusTimer) { clearInterval(statusTimer); statusTimer = null }
+    try { await loadAccounts() } catch {}
   }
+}
+
+/** ScheduleManager 的 "全部停止" 触发时，同步重置 Accounts 批量状态 */
+function onStopAllFromSchedule() {
+  running.value = false
+  currentRunId.value = null
+  if (statusTimer) { clearInterval(statusTimer); statusTimer = null }
 }
 
 function loadDreamBuyList() {
@@ -1812,7 +2021,12 @@ function closeTaskTemplateModal() {
 async function saveBatchSettings() {
   savingBatch.value = true
   try {
-    await api.put('/api/settings/batch', batchSettings.value)
+    // rateLimitRetryDelay 前端用秒，后端用毫秒，保存时转换
+    const payload = {
+      ...batchSettings.value,
+      rateLimitRetryDelay: Math.max(10, Number(batchSettings.value.rateLimitRetryDelay) || 60) * 1000,
+    }
+    await api.put('/api/settings/batch', payload)
     toast.show('全局设置已保存')
   } catch (e) {
     toast.show('保存失败: ' + e.message)
@@ -2423,5 +2637,35 @@ watch(logs, () => {
   color: var(--primary);
   border-radius: var(--radius-sm);
   font-size: 11px;
+}
+.log-filter-bar {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 12px; margin-bottom: 8px;
+  background: var(--bg-page, #f5f6f8);
+  border-radius: var(--radius-sm, 6px);
+}
+.log-filter-label {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 13px; color: var(--text-muted);
+}
+.log-date-input {
+  padding: 4px 8px; border-radius: var(--radius-sm, 6px);
+  border: 1px solid var(--border, #ddd); background: var(--bg-card, #fff);
+  color: var(--text-main, #333); font-size: 13px; outline: none;
+}
+.log-del-btn {
+  margin-left: 8px; padding: 2px 8px;
+  border: 1px solid var(--danger, #e74c3c); background: transparent;
+  color: var(--danger, #e74c3c); border-radius: var(--radius-sm, 6px);
+  font-size: 11px; cursor: pointer; transition: all 0.15s;
+}
+.log-del-btn:hover {
+  background: var(--danger, #e74c3c); color: #fff;
+}
+.log-check {
+  display: inline-flex; align-items: center; margin-right: 8px; cursor: pointer;
+}
+.log-check input {
+  cursor: pointer; width: 14px; height: 14px;
 }
 </style>
