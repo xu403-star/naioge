@@ -22,6 +22,8 @@ import { ConnectionPool } from "./lib/connectionPool.js";
 import { TaskRunner } from "./lib/taskRunner.js";
 import { Scheduler } from "./lib/scheduler.js";
 import { BatchEngine, executeBatchOperation } from "./lib/batchEngine.js";
+// 内存日志缓冲区：任务执行日志 + 系统日志统一走这里，前端轮询读取，不再写数据库（每账号仅末尾写1条汇总日志）
+import * as taskLogBuffer from "./lib/logBuffer.js";
 import accountsRouter, { setPool as setAccountsPool } from "./api/accounts.js";
 import tasksRouter, { setScheduler as setTasksScheduler } from "./api/tasks.js";
 import portalRouter from "./api/portal.js";
@@ -70,7 +72,6 @@ const scheduler = new Scheduler(pool, taskRunner, {
       await runner.run(accountId, {
         onLog: (entry) => {
           log(`[${accountName}] ${entry.message}`, entry.type || "info");
-          db.addLog(accountId, accountName, "daily", entry.message, entry.type || "info", account?.user_key);
         },
         onProgress: () => {},
         onDailyPointUpdate: (aid, point, max) => {
@@ -135,6 +136,20 @@ scheduler.setBatchRunner(async (operation, accountId, log, config = {}) => {
 // 定时清理已完成的运行记录，防止内存泄漏
 setInterval(() => batchEngine.cleanup(), 10 * 60 * 1000);
 
+// 定时清理7天前的汇总日志（每天凌晨执行一次）
+setInterval(() => {
+  try {
+    db.clearOldLogs(7);
+    console.log("[server] 已清理7天前的汇总日志");
+  } catch (e) {
+    console.error("[server] 清理旧日志失败:", e.message);
+  }
+}, 24 * 60 * 60 * 1000);
+// 启动后5分钟先执行一次清理
+setTimeout(() => {
+  try { db.clearOldLogs(7); } catch (e) {}
+}, 5 * 60 * 1000);
+
 // 游戏功能查询模块实例
 const gameModules = {
   status: new GameStatus(pool),
@@ -146,25 +161,20 @@ const gameModules = {
   tools: new GameTools(pool),
 };
 
-// 日志回调
-const logBuffer = []; // 保留最近200条日志
-const MAX_LOG = 200;
-
+// 日志回调：所有系统/任务日志统一写入内存缓冲区 taskLogBuffer（前端轮询读取）
+// 旧的 logBuffer 数组已废弃，由 lib/logBuffer.js 接管（环形缓冲区 + 增量拉取）
 function addLog(entry) {
   let time = entry.time;
   // 兼容传入的不是 ISO 格式的情况（如 toLocaleTimeString()）
   if (!time || isNaN(new Date(time).getTime())) {
     time = new Date().toISOString();
   }
-  const normalized = {
-    time,
-    level: entry.level || entry.type || "info",
-    message: entry.message,
-    accountId: entry.accountId || null,
-  };
-  logBuffer.push(normalized);
-  if (logBuffer.length > MAX_LOG) logBuffer.shift();
-  console.log(`[${normalized.level.toUpperCase()}] ${normalized.message}`);
+  const level = entry.level || entry.type || "info";
+  const message = entry.message;
+  const accountId = entry.accountId || null;
+  // 统一写入内存缓冲区（前端通过 /api/control/logs/buffer 增量拉取）
+  taskLogBuffer.push(accountId, message, level, { time });
+  console.log(`[${level.toUpperCase()}] ${message}`);
 }
 
 pool.setLogCallback(addLog);
@@ -474,7 +484,6 @@ app.post("/api/control/run-daily/:id", async (req, res) => {
       await new TaskRunner(pool).run(req.params.id, {
         onLog: (entry) => {
           addLog({ ...entry, accountId: req.params.id, message: `[${accountName}] ${entry.message}` });
-          db.addLog(req.params.id, account.name, "手动每日任务", entry.message, entry.type || "info", req.userKey);
         },
         onDailyPointUpdate: (accountId, point, max) => {
           // 活跃度变化时通过全局日志通道实时通知前端
@@ -496,16 +505,38 @@ app.post("/api/control/reload-schedules", (req, res) => {
   res.json({ success: true });
 });
 
-/** 获取服务器日志（过滤 debug 级别，避免前端泄露敏感信息） */
+/** 获取服务器日志（兼容旧前端：返回最近 N 条，按时间正序） */
 app.get("/api/control/logs", (req, res) => {
   const limit = parseInt(req.query.limit) || 100;
-  const filtered = logBuffer.filter(e => e.level !== "debug").slice(-limit);
+  const recent = taskLogBuffer.getRecent(limit);
+  // 过滤 debug 级别，字段映射为旧格式 { time, level, message, accountId }
+  const filtered = recent.filter(e => e.type !== "debug").map(e => ({
+    time: e.time,
+    level: e.type,
+    message: e.message,
+    accountId: e.accountId,
+  }));
   res.json(filtered);
+});
+
+/** 内存日志增量拉取（前端轮询用）
+ *  GET /api/control/logs/buffer?since=123&limit=200
+ *  返回 { logs: [...], lastSeq: 456, stats: {...} }
+ */
+app.get("/api/control/logs/buffer", (req, res) => {
+  const sinceSeq = parseInt(req.query.since) || 0;
+  const limit = Math.min(parseInt(req.query.limit) || 200, 500);
+  const result = taskLogBuffer.getSince(sinceSeq, limit);
+  res.json({
+    logs: result.logs,
+    lastSeq: result.lastSeq,
+    stats: taskLogBuffer.getStats(),
+  });
 });
 
 /** 清空服务器内存日志 */
 app.post("/api/control/clear-logs", (req, res) => {
-  logBuffer.length = 0;
+  // 缓冲区为环形自动覆盖，无需手动清空，保留接口兼容旧前端
   res.json({ success: true });
 });
 
@@ -1136,7 +1167,6 @@ app.post("/api/control/run-daily-batch", async (req, res) => {
         onLog: (entry) => {
           const msg = `[${name}] ${entry.message}`;
           addLog({ ...entry, accountId, message: msg });
-          db.addLog(accountId, account?.name || accountId, "批量每日任务", entry.message, entry.type || "info", req.userKey);
         },
         onDailyPointUpdate: (aid, point, max) => {
           addLog({ accountId: aid, message: `__DAILY_POINT_UPDATE__:${point}/${max}`, type: "info" });
@@ -1193,7 +1223,6 @@ app.post("/api/control/run-daily-batch", async (req, res) => {
             onLog: (entry) => {
               const msg = `[${name}] ${entry.message}`;
               addLog({ ...entry, accountId: item.accountId, message: msg });
-              db.addLog(item.accountId, account?.name || item.accountId, "批量每日任务", entry.message, entry.type || "info", req.userKey);
             },
             onDailyPointUpdate: (aid, point, max) => {
               addLog({ accountId: aid, message: `__DAILY_POINT_UPDATE__:${point}/${max}`, type: "info" });
@@ -1260,7 +1289,6 @@ app.post("/api/control/run-daily-all", async (req, res) => {
         onLog: (entry) => {
           const msg = `[${name}] ${entry.message}`;
           addLog({ ...entry, accountId, message: msg });
-          db.addLog(accountId, account?.name || accountId, "批量每日任务", entry.message, entry.type || "info", req.userKey);
         },
         onDailyPointUpdate: (aid, point, max) => {
           addLog({ accountId: aid, message: `__DAILY_POINT_UPDATE__:${point}/${max}`, type: "info" });
@@ -1311,7 +1339,6 @@ app.post("/api/control/run-daily-all", async (req, res) => {
             onLog: (entry) => {
               const msg = `[${name}] ${entry.message}`;
               addLog({ ...entry, accountId: item.accountId, message: msg });
-              db.addLog(item.accountId, account?.name || item.accountId, "批量每日任务", entry.message, entry.type || "info", req.userKey);
             },
             onDailyPointUpdate: (aid, point, max) => {
               addLog({ accountId: aid, message: `__DAILY_POINT_UPDATE__:${point}/${max}`, type: "info" });
@@ -1869,29 +1896,7 @@ app.post("/api/game/raw/:id", async (req, res) => {
   } catch (e) { res.status(e.status || 500).json({ error: e.message }); }
 });
 
-/** SSE 实时日志推送 */
-app.get("/api/control/logs/stream", (req, res) => {
-  res.writeHead(200, {
-    "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache",
-    Connection: "keep-alive",
-    "X-Accel-Buffering": "no",
-  });
-
-  res.write("data: {\"init\":true}\n\n");
-
-  // 定期发送日志
-  const interval = setInterval(() => {
-    const recent = logBuffer.slice(-20);
-    if (recent.length > 0) {
-      res.write(`data: ${JSON.stringify(recent)}\n\n`);
-    }
-  }, 2000);
-
-  req.on("close", () => {
-    clearInterval(interval);
-  });
-});
+// SSE 实时日志推送已移除：改为前端轮询 /api/control/logs/buffer（增量拉取），减轻服务器长连接压力
 
 // ======== 静态文件（前端） ========
 // 优先使用 Vue 构建的 dist-vue，回退到 public

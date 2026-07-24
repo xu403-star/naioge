@@ -116,9 +116,22 @@ export async function initDatabase() {
         task_name TEXT,
         status TEXT,
         message TEXT,
+        duration INTEGER DEFAULT 0,
+        extra TEXT,
         created_at TEXT DEFAULT (datetime('now','localtime'))
       )
     `);
+    // 迁移：为旧表添加新字段
+    try {
+      const logCols = queryAll("PRAGMA table_info(task_logs)");
+      const colNames = logCols.map(c => c.name);
+      if (!colNames.includes('duration')) {
+        db.run("ALTER TABLE task_logs ADD COLUMN duration INTEGER DEFAULT 0");
+      }
+      if (!colNames.includes('extra')) {
+        db.run("ALTER TABLE task_logs ADD COLUMN extra TEXT");
+      }
+    } catch {}
 
     // ======== 任务模板表 ========
     db.run(`
@@ -692,9 +705,11 @@ export function removeSchedule(id, userKey) {
 
 // ======== 日志 ========
 
-export function addLog(accountId, accountName, taskName, status, message, userKey) {
-  exec("INSERT INTO task_logs (user_key, account_id, account_name, task_name, status, message) VALUES (?, ?, ?, ?, ?, ?)",
-    [userKey || 'default', accountId, accountName, taskName, status, message]);
+export function addLog(accountId, accountName, taskName, status, message, userKey, extra = null) {
+  const duration = extra?.duration || 0;
+  const extraJson = extra ? JSON.stringify(extra) : null;
+  exec("INSERT INTO task_logs (user_key, account_id, account_name, task_name, status, message, duration, extra) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    [userKey || 'default', accountId, accountName, taskName, status, message, duration, extraJson]);
 }
 
 export function getRecentLogs(limit = 100, userKey) {

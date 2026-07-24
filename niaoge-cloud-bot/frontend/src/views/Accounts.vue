@@ -142,6 +142,28 @@
           </div>
         </div>
 
+        <!-- 任务执行情况汇总（点击展开/收起，显示每个账号的子任务详情） -->
+        <div v-if="summaryLogs.length > 0" class="panel summary-panel">
+          <div class="panel-header" style="cursor:pointer" @click="summaryExpanded = !summaryExpanded">
+            <h2>任务执行情况 ({{ summaryLogs.length }})</h2>
+            <div class="panel-actions">
+              <button class="btn btn-xs btn-outline" @click.stop="loadSummaryLogs">刷新</button>
+              <span class="summary-toggle-icon">{{ summaryExpanded ? '▼' : '▶' }}</span>
+            </div>
+          </div>
+          <div v-if="summaryExpanded" class="summary-list">
+            <div v-for="(log, i) in summaryLogs" :key="i" class="summary-row" :class="'summary-' + log.status">
+              <div class="summary-row-header">
+                <span class="summary-account">{{ log.account_name || log.account_id }}</span>
+                <span class="summary-status-tag" :class="'tag-' + log.status">{{ summaryStatusText(log.status) }}</span>
+                <span class="summary-duration">{{ formatDuration(log.duration) }}</span>
+                <span class="summary-time">{{ formatLogTime(log.created_at) }}</span>
+              </div>
+              <div class="summary-detail">{{ log.message }}</div>
+            </div>
+          </div>
+        </div>
+
         <div v-if="logs.length > 0" class="panel log-panel">
           <div class="panel-header">
             <h2>执行日志</h2>
@@ -635,6 +657,11 @@ const logs = ref([])
 const logListRef = ref(null)
 const autoScrollLog = ref(true)
 let logTimer = null
+let lastLogSeq = 0  // 增量拉取的游标（对应后端 taskLogBuffer 的 seq）
+
+// 任务执行情况汇总（从数据库读取的汇总日志，每账号1条）
+const summaryLogs = ref([])
+const summaryExpanded = ref(false)
 
 const accountStatusMap = reactive({})
 const statusPollingSet = new Set()
@@ -1020,6 +1047,7 @@ onMounted(async () => {
   loadCurrentUser()
   loading.value = false
   startLogPolling()
+  loadSummaryLogs()
   refreshAccountStatusForAll()
   startStatusPolling()
 })
@@ -1142,26 +1170,44 @@ async function loadStats() {
 function startLogPolling() {
   if (logTimer) return
   fetchServerLogs()
-  logTimer = setInterval(fetchServerLogs, 2000)
+  logTimer = setInterval(fetchServerLogs, 1500)
 }
 
+// 增量拉取内存缓冲区日志（不再每次拉全量，减轻服务器压力）
 async function fetchServerLogs() {
   try {
-    const serverLogs = await api.get('/api/control/logs?limit=100')
-    if (Array.isArray(serverLogs) && serverLogs.length > 0) {
-      const existingKeys = new Set(logs.value.map(l => l.isoTime + '|' + l.message))
-      for (const entry of serverLogs) {
-        const isoTime = entry.time || new Date().toISOString()
-        const key = isoTime + '|' + entry.message
-        if (!existingKeys.has(key)) {
+    const res = await api.get(`/api/control/logs/buffer?since=${lastLogSeq}&limit=200`)
+    if (res && Array.isArray(res.logs) && res.logs.length > 0) {
+      for (const entry of res.logs) {
+        // 解析活跃度实时更新消息（不显示为日志，直接更新账号状态）
+        const m = /^__DAILY_POINT_UPDATE__:(\d+)\/(\d+)$/.exec(entry.message)
+        if (m && entry.accountId) {
+          const cur = accountStatusMap[entry.accountId] || {}
+          accountStatusMap[entry.accountId] = {
+            ...cur,
+            dailyPoint: Number(m[1]),
+            dailyPointMax: Number(m[2]),
+            pending: true,
+          }
+        } else {
+          const isoTime = entry.time || new Date().toISOString()
           logs.value.push({
             time: new Date(isoTime).toLocaleTimeString(),
             isoTime,
             message: dedupeLogMessage(entry.message),
-            type: entry.level || 'info'
+            type: entry.type || 'info',
+            accountId: entry.accountId || null,
           })
-          if (logs.value.length > 200) logs.value.shift()
+          if (logs.value.length > 300) logs.value.shift()
         }
+      }
+      // 更新游标
+      if (res.lastSeq > lastLogSeq) lastLogSeq = res.lastSeq
+      // 自动滚动
+      if (autoScrollLog.value) {
+        nextTick(() => {
+          if (logListRef.value) logListRef.value.scrollTop = logListRef.value.scrollHeight
+        })
       }
     }
   } catch (e) {
@@ -1234,10 +1280,10 @@ async function waitDailyCompleteAndRefresh(id) {
   for (let i = 0; i < 60; i++) {
     await new Promise(r => setTimeout(r, 3000))
     try {
-      const serverLogs = await api.get('/api/control/logs?limit=200')
-
-      // 检测完成标志
-      const completed = serverLogs.some(l =>
+      // 通过增量缓冲区接口拉取最新日志
+      await fetchServerLogs()
+      // 检测完成标志（在本地 logs 中查找）
+      const completed = logs.value.some(l =>
         l.accountId === id && /手动每日任务完成|所有任务执行完成|每日任务完成/.test(l.message)
       )
       if (completed) {
@@ -1249,6 +1295,8 @@ async function waitDailyCompleteAndRefresh(id) {
           const s = accountStatusMap[id]
           if (s) delete s.pending
         }
+        // 手动每日完成后刷新任务执行情况汇总
+        loadSummaryLogs()
         return
       }
     } catch (e) {
@@ -1894,6 +1942,8 @@ function startPollingRunStatus() {
           await loadAccountDailySnapshot(id)
         }
         addLog(`[${currentOperationLabel.value || '批量任务'}] 全部执行完成`, 'success')
+        // 批量完成后刷新任务执行情况汇总
+        loadSummaryLogs()
       }
     } catch (e) {
       // 忽略轮询错误
@@ -2141,6 +2191,51 @@ function dedupeLogMessage(message) {
   return message.replace(/(\[[^\]]+\])(\s*\1)+/g, '$1')
 }
 
+// ======== 任务执行情况汇总 ========
+
+// 从数据库拉取最近的汇总日志（每账号1条，含子任务详情）
+async function loadSummaryLogs() {
+  try {
+    const res = await api.get('/api/tasks/logs/recent?limit=50')
+    if (Array.isArray(res)) {
+      summaryLogs.value = res
+    }
+  } catch (e) {
+    // 忽略
+  }
+}
+
+function summaryStatusText(status) {
+  const map = {
+    success: '成功',
+    failed: '失败',
+    partial: '部分成功',
+    rate_limited: '限流中断',
+    stopped: '已停止',
+    warning: '警告',
+    error: '错误',
+  }
+  return map[status] || status || '未知'
+}
+
+function formatDuration(seconds) {
+  if (!seconds || seconds <= 0) return ''
+  if (seconds < 60) return `${seconds}秒`
+  const m = Math.floor(seconds / 60)
+  const s = seconds % 60
+  return s > 0 ? `${m}分${s}秒` : `${m}分`
+}
+
+function formatLogTime(timeStr) {
+  if (!timeStr) return ''
+  try {
+    const d = new Date(timeStr.replace(' ', 'T'))
+    return d.toLocaleTimeString()
+  } catch {
+    return timeStr
+  }
+}
+
 function addLog(message, type = 'info') {
   logs.value.push({ time: new Date().toLocaleTimeString(), message: dedupeLogMessage(message), type })
   if (logs.value.length > 200) logs.value.shift()
@@ -2379,6 +2474,59 @@ watch(logs, () => {
 .op-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 .op-btn.danger { border-color: var(--danger, #ff4d4f); color: var(--danger, #ff4d4f); }
 .log-panel { margin-top: 16px; }
+
+/* 任务执行情况汇总面板 */
+.summary-panel { margin-top: 16px; }
+.summary-toggle-icon { font-size: 12px; color: var(--text-muted, #999); margin-left: 8px; }
+.summary-list {
+  max-height: 400px;
+  overflow-y: auto;
+  padding: 8px 16px;
+}
+.summary-row {
+  padding: 10px 12px;
+  margin-bottom: 6px;
+  border-radius: var(--radius-md, 8px);
+  background: var(--bg-card, #fff);
+  border-left: 3px solid var(--primary, #1890ff);
+  font-size: 13px;
+}
+.summary-row.summary-success { border-left-color: var(--success, #52c41a); }
+.summary-row.summary-failed { border-left-color: var(--danger, #ff4d4f); }
+.summary-row.summary-partial { border-left-color: var(--warning, #faad14); }
+.summary-row.summary-rate_limited { border-left-color: var(--warning, #faad14); }
+.summary-row.summary-stopped { border-left-color: var(--text-muted, #999); }
+.summary-row-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+  flex-wrap: wrap;
+}
+.summary-account { font-weight: 600; color: var(--text-main, #333); }
+.summary-status-tag {
+  font-size: 11px;
+  padding: 1px 8px;
+  border-radius: 10px;
+  font-weight: 600;
+}
+.tag-success { background: rgba(82,196,26,0.15); color: var(--success, #52c41a); }
+.tag-failed { background: rgba(255,77,79,0.15); color: var(--danger, #ff4d4f); }
+.tag-partial { background: rgba(250,173,20,0.15); color: var(--warning, #faad14); }
+.tag-rate_limited { background: rgba(250,173,20,0.15); color: var(--warning, #faad14); }
+.tag-stopped { background: rgba(153,153,153,0.15); color: var(--text-muted, #999); }
+.tag-warning { background: rgba(250,173,20,0.15); color: var(--warning, #faad14); }
+.tag-error { background: rgba(255,77,79,0.15); color: var(--danger, #ff4d4f); }
+.summary-duration { font-size: 12px; color: var(--text-muted, #999); }
+.summary-time { font-size: 12px; color: var(--text-muted, #999); margin-left: auto; }
+.summary-detail {
+  font-size: 12px;
+  color: var(--text-muted, #666);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  word-break: break-all;
+  line-height: 1.5;
+}
+
 .log-list {
   max-height: 320px;
   overflow-y: auto;

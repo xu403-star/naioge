@@ -8,16 +8,16 @@
     </div>
 
     <div style="display:flex;gap:8px;margin-bottom:16px">
-      <button class="btn btn-sm" :class="sseOn ? 'btn-primary' : 'btn-outline'" @click="toggleSSE">
-        {{ sseOn ? '● SSE 连接中' : '○ 开始监听' }}
+      <button class="btn btn-sm" :class="polling ? 'btn-primary' : 'btn-outline'" @click="togglePolling">
+        {{ polling ? '● 监听中' : '○ 开始监听' }}
       </button>
-      <button class="btn btn-sm btn-outline" @click="loadLogs">刷新</button>
+      <button class="btn btn-sm btn-outline" @click="loadRecent">刷新</button>
       <button class="btn btn-sm btn-outline" @click="logs = []" style="color:var(--danger)">清屏</button>
     </div>
 
-    <div v-for="(log, i) in logs" :key="i" class="log-card" :class="'log-' + log.level">
+    <div v-for="(log, i) in logs" :key="i" class="log-card" :class="'log-' + log.type">
       <div class="log-time">{{ log.time }}</div>
-      <div class="log-msg">{{ log.msg || log.message }}</div>
+      <div class="log-msg">{{ log.message }}</div>
     </div>
 
     <div v-if="logs.length === 0" class="text-center text-muted" style="padding:40px">暂无日志，点击"开始监听"接收实时日志</div>
@@ -26,49 +26,63 @@
 
 <script setup>
 import { ref, onMounted, onUnmounted } from 'vue'
+import { api } from '../api'
 import { useToastStore } from '../stores/toast'
 
 const toast = useToastStore()
 const logs = ref([])
-const sseOn = ref(false)
-let eventSource = null
+const polling = ref(false)
+let timer = null
+let lastSeq = 0
 
-function addLog(log) {
-  logs.value.unshift({ time: new Date().toLocaleTimeString(), ...log })
-  if (logs.value.length > 200) logs.value.pop()
-}
-
-async function loadLogs() {
+async function loadRecent() {
   try {
-    const res = await fetch('/api/control/logs')
-    const data = await res.json()
-    if (Array.isArray(data)) {
-      logs.value = data.reverse().map(l => ({ ...l, time: l.time || l.timestamp }))
+    const res = await api.get('/api/control/logs/buffer?limit=200')
+    if (res && Array.isArray(res.logs)) {
+      logs.value = res.logs.map(l => ({
+        time: new Date(l.time).toLocaleTimeString(),
+        message: l.message,
+        type: l.type || 'info',
+      }))
+      if (res.lastSeq > lastSeq) lastSeq = res.lastSeq
     }
   } catch { toast.show('加载日志失败') }
 }
 
-function toggleSSE() {
-  if (sseOn.value) { stopSSE(); return }
-  startSSE()
+async function fetchIncremental() {
+  try {
+    const res = await api.get(`/api/control/logs/buffer?since=${lastSeq}&limit=200`)
+    if (res && Array.isArray(res.logs) && res.logs.length > 0) {
+      for (const entry of res.logs) {
+        logs.value.push({
+          time: new Date(entry.time).toLocaleTimeString(),
+          message: entry.message,
+          type: entry.type || 'info',
+        })
+      }
+      if (logs.value.length > 500) logs.value.splice(0, logs.value.length - 500)
+      if (res.lastSeq > lastSeq) lastSeq = res.lastSeq
+    }
+  } catch { /* ignore */ }
 }
 
-function startSSE() {
-  eventSource = new EventSource('/api/control/logs/stream')
-  eventSource.onmessage = (e) => {
-    try { addLog(JSON.parse(e.data)) } catch { addLog({ msg: e.data, level: 'info' }) }
-  }
-  eventSource.onerror = () => { stopSSE(); toast.show('SSE 连接断开') }
-  sseOn.value = true
+function togglePolling() {
+  polling.value ? stopPolling() : startPolling()
 }
 
-function stopSSE() {
-  if (eventSource) { eventSource.close(); eventSource = null }
-  sseOn.value = false
+function startPolling() {
+  fetchIncremental()
+  timer = setInterval(fetchIncremental, 1500)
+  polling.value = true
 }
 
-onMounted(loadLogs)
-onUnmounted(stopSSE)
+function stopPolling() {
+  if (timer) { clearInterval(timer); timer = null }
+  polling.value = false
+}
+
+onMounted(loadRecent)
+onUnmounted(stopPolling)
 </script>
 
 <style scoped>
@@ -77,11 +91,10 @@ onUnmounted(stopSSE)
   border-radius: var(--radius-md); display: flex; flex-direction: column; gap: 4px;
   box-shadow: var(--shadow-sm);
 }
-.log-card:before { font-size: 11px; font-weight: 600; text-transform: uppercase; }
 .log-time { font-size: 12px; color: var(--text-muted); font-family: monospace; }
 .log-msg { font-size: 14px; color: var(--text-main); word-break: break-all; }
 .log-success { border-left: 3px solid var(--success); }
 .log-error { border-left: 3px solid var(--danger); }
-.log-warn { border-left: 3px solid var(--warning); }
+.log-warning { border-left: 3px solid var(--warning); }
 .log-info { border-left: 3px solid var(--primary); }
 </style>

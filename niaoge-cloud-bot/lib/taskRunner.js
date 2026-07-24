@@ -3,6 +3,7 @@
  * 适配 Node.js + SQLite + ConnectionPool
  */
 import * as db from "./db.js";
+import * as logBuffer from "./logBuffer.js";
 import { CarTasks } from "./batch/tasksCar.js";
 import { isExecutedToday, markExecutedToday } from "./batch/dailyExecutedUtils.js";
 import { getSnapshotDay as getDailySnapshotDay, saveDailySnapshot } from "./game/gameStatus.js";
@@ -229,6 +230,8 @@ export class TaskRunner {
       // 账号名前缀由上层（scheduler.accountLog / BatchEngine）统一添加，这里只输出纯消息
       this.callbacks.onLog({ time: new Date().toLocaleTimeString(), message, type });
     }
+    // 同步写入内存缓冲区（不写数据库，前端通过轮询读取）
+    logBuffer.push(this._currentAccountId || null, message, type);
   }
 
   /**
@@ -398,6 +401,11 @@ export class TaskRunner {
 
     this.currentAccountName = accountName;
     this.currentRoleId = "";
+    this._currentAccountId = accountId;
+
+    // 子任务结果收集（用于结束时写汇总日志）
+    this._subTaskResults = [];
+    this._taskStartTime = Date.now();
 
     // 活跃度只在任务结束时保存一次最终值，执行过程中不再反复保存和推送
     // 前端通过 API /api/accounts/:id/daily-point 读取最后一次保存的快照
@@ -1007,7 +1015,7 @@ export class TaskRunner {
           await new Promise(r => setTimeout(r, 1000)); // 重连后等待稳定
         } catch (reconnectErr) {
           this.log(`重连失败: ${reconnectErr.message}，跳过 ${task.name}`, "error");
-          db.addLog(accountId, accountName, task.name, "failed", `重连失败: ${reconnectErr.message}`);
+          this._subTaskResults.push({ name: task.name, status: "failed", reason: `重连失败: ${reconnectErr.message}` });
           continue;
         }
       }
@@ -1066,13 +1074,14 @@ export class TaskRunner {
           }
 
           this.log(`任务失败: ${task.name} - ${errMsg}`, "error");
-          db.addLog(accountId, accountName, task.name, "failed", errMsg);
+          this._subTaskResults.push({ name: task.name, status: "failed", reason: errMsg });
           break;
         }
       }
 
       // 限流后跳出整个循环（外层 break 只跳出 attempt 循环，这里再跳出 task 循环）
       if (this.hasRateLimitError) {
+        this._subTaskResults.push({ name: task.name, status: "rate_limited", reason: "服务器限流" });
         break;
       }
 
@@ -1081,7 +1090,9 @@ export class TaskRunner {
         markDone(task.name);
       }
 
+      // 收集成功的子任务
       if (taskSuccess) {
+        this._subTaskResults.push({ name: task.name, status: timeSkipped ? "skipped" : "success" });
         const progress = Math.floor(((i + 1) / totalTasks) * 100);
         if (this.callbacks.onProgress) this.callbacks.onProgress(progress);
       }
@@ -1169,6 +1180,33 @@ export class TaskRunner {
     } else {
       this.log("所有任务执行完成", "success");
     }
+
+    // ======== 写汇总日志到数据库（每账号仅1条，含子任务详情） ========
+    const duration = Math.floor((Date.now() - this._taskStartTime) / 1000);
+    const successCount = this._subTaskResults.filter(r => r.status === "success").length;
+    const failedCount = this._subTaskResults.filter(r => r.status === "failed").length;
+    const skippedCount = this._subTaskResults.filter(r => r.status === "skipped").length;
+    const rateLimitedCount = this._subTaskResults.filter(r => r.status === "rate_limited").length;
+    let overallStatus = "success";
+    if (this.hasRateLimitError) overallStatus = "rate_limited";
+    else if (this.pool.isAborted(accountId)) overallStatus = "stopped";
+    else if (failedCount > 0 && successCount === 0) overallStatus = "failed";
+    else if (failedCount > 0) overallStatus = "partial";
+
+    const subTaskSummary = this._subTaskResults.map(r => {
+      if (r.status === "success") return `${r.name}✓`;
+      if (r.status === "skipped") return `${r.name}⊘`;
+      if (r.status === "rate_limited") return `${r.name}⚠`;
+      return `${r.name}✗(${r.reason || "失败"})`;
+    }).join(" ");
+
+    db.addLog(accountId, accountName, "daily", overallStatus, subTaskSummary, account?.user_key, {
+      duration,
+      successCount,
+      failedCount,
+      skippedCount,
+      rateLimitedCount,
+    });
 
     // 返回限流信息供外层（batchEngine）做断点续跑
     return {

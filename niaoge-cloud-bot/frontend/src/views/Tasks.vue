@@ -132,9 +132,9 @@
     <!-- ========== 日志 ========== -->
     <template v-if="tab === 'logs'">
       <div style="display:flex;gap:8px;margin-bottom:16px">
-        <button class="btn btn-sm" :class="sseOn ? 'btn-primary' : 'btn-outline'" @click="toggleSSE">
-          <span :class="sseOn ? 'status-dot online' : 'status-dot offline'" style="width:6px;height:6px"></span>
-          {{ sseOn ? 'SSE 监听中' : '开始监听' }}
+        <button class="btn btn-sm" :class="polling ? 'btn-primary' : 'btn-outline'" @click="togglePolling">
+          <span :class="polling ? 'status-dot online' : 'status-dot offline'" style="width:6px;height:6px"></span>
+          {{ polling ? '监听中' : '开始监听' }}
         </button>
         <button class="btn btn-sm btn-outline" @click="loadLogs">刷新</button>
         <button class="btn btn-sm btn-outline" @click="logs = []" style="color:var(--danger)">清屏</button>
@@ -450,8 +450,9 @@ async function deleteSchedule(s) {
 
 // --- 日志 ---
 const logs = ref([])
-const sseOn = ref(false)
-let eventSource = null
+const polling = ref(false)
+let logTimer = null
+let lastLogSeq = 0
 
 function addLog(log) {
   logs.value.unshift({ time: new Date().toLocaleTimeString(), ...log })
@@ -459,25 +460,44 @@ function addLog(log) {
 }
 async function loadLogs() {
   try {
-    const res = await fetch('/api/control/logs')
-    const data = await res.json()
-    if (Array.isArray(data)) logs.value = data.reverse().map(l => ({ ...l, time: l.time || l.timestamp }))
+    const res = await api.get('/api/control/logs/buffer?limit=200')
+    if (res && Array.isArray(res.logs)) {
+      logs.value = res.logs.reverse().map(l => ({
+        time: new Date(l.time).toLocaleTimeString(),
+        message: l.message,
+        type: l.type || 'info',
+      }))
+      if (res.lastSeq > lastLogSeq) lastLogSeq = res.lastSeq
+    }
   } catch { toast.show('加载日志失败') }
 }
-function toggleSSE() {
-  sseOn.value ? stopSSE() : startSSE()
+function togglePolling() {
+  polling.value ? stopPolling() : startPolling()
 }
-function startSSE() {
-  eventSource = new EventSource('/api/control/logs/stream')
-  eventSource.onmessage = (e) => {
-    try { addLog(JSON.parse(e.data)) } catch { addLog({ msg: e.data, level: 'info' }) }
-  }
-  eventSource.onerror = () => { stopSSE(); toast.show('SSE 连接断开') }
-  sseOn.value = true
+function startPolling() {
+  fetchIncrementalLogs()
+  logTimer = setInterval(fetchIncrementalLogs, 1500)
+  polling.value = true
 }
-function stopSSE() {
-  if (eventSource) { eventSource.close(); eventSource = null }
-  sseOn.value = false
+async function fetchIncrementalLogs() {
+  try {
+    const res = await api.get(`/api/control/logs/buffer?since=${lastLogSeq}&limit=200`)
+    if (res && Array.isArray(res.logs) && res.logs.length > 0) {
+      for (const entry of res.logs) {
+        logs.value.unshift({
+          time: new Date(entry.time).toLocaleTimeString(),
+          message: entry.message,
+          type: entry.type || 'info',
+        })
+      }
+      if (logs.value.length > 200) logs.value.splice(200)
+      if (res.lastSeq > lastLogSeq) lastLogSeq = res.lastSeq
+    }
+  } catch { /* ignore */ }
+}
+function stopPolling() {
+  if (logTimer) { clearInterval(logTimer); logTimer = null }
+  polling.value = false
 }
 
 onMounted(async () => {
@@ -490,7 +510,7 @@ onMounted(async () => {
     if (onlineIds.length) selectedIds.value = new Set(onlineIds)
   } catch { }
 })
-onUnmounted(stopSSE)
+onUnmounted(stopPolling)
 </script>
 
 <style scoped>
